@@ -1,0 +1,20 @@
+{
+  "name": "suishin",
+  "type": "module",
+  "scripts": {
+    "dev:workers": "wrangler dev",
+    "dev:bun": "bun --env-file=.env src/bun.ts",
+    "deploy": "wrangler deploy --minify",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "load:sponsor": "node scripts/mock-sponsor-load.mjs"
+  },
+  "dependencies": {
+    "@mysten/sui": "^2.5.0",
+    "envalid": "^8.1.1",
+    "hono": "^4.12.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "wrangler": "^4.4.0"
+  }
+}
