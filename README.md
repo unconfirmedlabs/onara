@@ -2,7 +2,7 @@
 
 Sui transaction sponsorship server with a declarative policy engine. Clients submit pre-built, pre-signed transactions; the server validates them against a set of JSON policies and, if approved, co-signs with the sponsor keypair and submits on-chain.
 
-Runs on **Bun** (local dev) and **Cloudflare Workers** (production).
+Runs on **Bun** and **Cloudflare Workers**.
 
 ## Quick start
 
