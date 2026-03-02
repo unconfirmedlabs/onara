@@ -16,7 +16,7 @@ import { OnaraClient } from '@onara/sdk'
 const onara = new OnaraClient('https://my-onara.example.com')
 
 // Check sponsor status
-const { address, network, chainId } = await onara.status()
+const { address, balances } = await onara.status()
 
 // View configured policies
 const policies = await onara.policies()
@@ -49,7 +49,7 @@ Create a client with options. The optional `fetch` parameter allows injecting a 
 
 ### `client.status()`
 
-Returns the server's network and sponsor address.
+Returns the server's network, chain identifier, sponsor address, and balances.
 
 ### `client.policies()`
 

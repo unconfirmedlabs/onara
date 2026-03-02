@@ -48,15 +48,25 @@ const SPONSORED_POLICIES = loadPolicies(sponsorPoliciesConfig)
 app.get('/status', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
+  const address = getKeyPair(SUI_MNEMONIC).toSuiAddress()
   let chainId: string | null = null
+  let balances: { active: string; pending: string } | null = null
   try {
-    const result = await grpcClient.core.getChainIdentifier()
-    chainId = result.chainIdentifier
+    const [chainResult, balanceResult] = await Promise.all([
+      grpcClient.core.getChainIdentifier(),
+      grpcClient.getBalance({ owner: address }),
+    ])
+    chainId = chainResult.chainIdentifier
+    balances = {
+      active: balanceResult.balance.addressBalance,
+      pending: balanceResult.balance.coinBalance,
+    }
   } catch {}
   return c.json({
     network: SUI_NETWORK,
     chainId,
-    address: getKeyPair(SUI_MNEMONIC).toSuiAddress(),
+    address,
+    balances,
   })
 })
 
@@ -64,24 +74,39 @@ app.get('/policies', (c) => {
   return c.json(sponsorPoliciesConfig)
 })
 
-app.get('/refill/:coinId', async (c) => {
-  const coinId = c.req.param('coinId')
-
-  if (!coinId) {
-    return c.json({ error: 'Missing coinId parameter.' }, 400)
-
-  }
+app.post('/refill', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
   const keypair = Ed25519Keypair.deriveKeypair(SUI_MNEMONIC)
+  const address = keypair.toSuiAddress()
+
+  const SUI_TYPE = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI'
+  const coins: { objectId: string; balance: string }[] = []
+  let cursor: string | null = null
+
+  do {
+    const page = await grpcClient.listCoins({ owner: address, coinType: SUI_TYPE, cursor })
+    coins.push(...page.objects.map((coin) => ({ objectId: coin.objectId, balance: coin.balance })))
+    cursor = page.hasNextPage ? page.cursor : null
+  } while (cursor)
+
+  if (coins.length === 0) {
+    return c.json({ message: 'No coins to refill.', coins: 0 })
+  }
+
   const tx = new Transaction()
-  tx.moveCall({
-    target: '0x0000000000000000000000000000000000000000000000000000000000000002::coin::send_funds',
-    arguments: [tx.object(coinId), tx.pure.address(keypair.toSuiAddress())],
-    typeArguments: ['0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI']
-  })
+  for (const coin of coins) {
+    tx.moveCall({
+      target: `${SUI_TYPE.split('::')[0]}::coin::send_funds`,
+      arguments: [tx.object(coin.objectId), tx.pure.address(address)],
+      typeArguments: [SUI_TYPE],
+    })
+  }
+
   const result = await grpcClient.signAndExecuteTransaction({ signer: keypair, transaction: tx })
-  return c.json(result)
+  await grpcClient.waitForTransaction({ result })
+
+  return c.json({ message: `Refilled ${coins.length} coin(s) to address balance.`, coins: coins.length, result })
 })
 
 app.post('/sponsor', async (c) => {

@@ -4,6 +4,7 @@ export type StatusResponse = {
   network: string
   chainId: string | null
   address: string
+  balances: { active: string; pending: string } | null
 }
 
 // ─── Policy Config Types ─────────────────────────────────────────────────────

@@ -29,29 +29,41 @@ bun run deploy
 | `SUI_NETWORK` | Network identifier (e.g. `testnet`, `mainnet`) |
 | `SUI_GRPC_URL` | Sui gRPC endpoint URL |
 | `SUI_MNEMONIC` | BIP-39 mnemonic for the sponsor keypair |
-| `DRY_RUN_ONLY` | When set, `/sponsor` always returns dry-run results and `/refill` is disabled |
+| `DRY_RUN_ONLY` | When set, `/sponsor` always returns dry-run results |
+| `EXECUTION_TIMEOUT_MS` | Max execution time in ms (default: `30000`) |
 
 ## API
 
 ### `GET /status`
 
-Returns the network, chain identifier, and sponsor address.
+Returns the network, chain identifier, sponsor address, and balances.
 
 ```json
 {
   "network": "testnet",
-  "chainId": "4c78adac",
-  "address": "0x..."
+  "chainId": "69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD",
+  "address": "0x...",
+  "balances": {
+    "active": "1000000000",
+    "pending": "500000000"
+  }
 }
 ```
 
-### `GET /refill/:coinId`
+- `active` — address balance (fund accumulator), available for sponsoring transactions
+- `pending` — coin balance, needs `/refill` to move into the active balance
 
-Merges the specified coin object back to the sponsor's gas. Useful for reclaiming scattered coins.
+### `GET /policies`
+
+Returns the array of configured policy JSON configs.
+
+### `POST /refill`
+
+Scans all SUI coin objects owned by the sponsor and transfers them into the address balance (fund accumulator). Returns the number of coins refilled.
 
 ### `POST /sponsor`
 
-Validates, co-signs, and executes a sponsored transaction.
+Validates, simulates, co-signs, and executes a sponsored transaction.
 
 **Query parameters:**
 
@@ -59,6 +71,7 @@ Validates, co-signs, and executes a sponsored transaction.
 |---|---|---|---|
 | `waitForExecution` | `boolean` | `true` | Wait for transaction finality before responding |
 | `dryRun` | `boolean` | `false` | Validate against policies only — do not sign or submit |
+| `executionTimeoutMs` | `number` | `30000` | Execution timeout in milliseconds (capped at server max) |
 
 **Request body:**
 
