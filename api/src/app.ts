@@ -12,6 +12,7 @@ type Bindings = {
   SUI_GRPC_URL: string
   SUI_NETWORK: string
   SUI_MNEMONIC: string
+  DRY_RUN_ONLY?: string
 }
 
 const app = new Hono()
@@ -42,11 +43,21 @@ const SPONSORED_POLICIES = loadPolicies(sponsorPoliciesConfig)
 
 app.get('/status', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
+  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
+  let chainId: string | null = null
+  try {
+    const result = await grpcClient.core.getChainIdentifier()
+    chainId = result.chainIdentifier
+  } catch {}
   return c.json({
     network: SUI_NETWORK,
-    grpcUrl: SUI_GRPC_URL,
+    chainId,
     address: getKeyPair(SUI_MNEMONIC).toSuiAddress(),
   })
+})
+
+app.get('/policies', (c) => {
+  return c.json(sponsorPoliciesConfig)
 })
 
 app.get('/refill/:coinId', async (c) => {
@@ -70,8 +81,10 @@ app.get('/refill/:coinId', async (c) => {
 })
 
 app.post('/sponsor', async (c) => {
-  const waitForExecution = z.coerce.boolean().parse(c.req.query('waitForExecution') ?? 'false')
-  const dryRun = z.coerce.boolean().parse(c.req.query('dryRun') ?? 'false')
+  const { DRY_RUN_ONLY } = env<Bindings>(c)
+  const parseBool = (v: string | undefined) => v === 'true' || v === '1'
+  const waitForExecution = c.req.query('waitForExecution') !== 'false'
+  const dryRun = !!DRY_RUN_ONLY || parseBool(c.req.query('dryRun'))
 
   const payload = (await c.req.json()) as {
     sender?: string
@@ -123,11 +136,23 @@ app.post('/sponsor', async (c) => {
     return c.json({ dryRun: true, policy: matchedPolicyName, moveCallTargets: calledTargets })
   }
 
+  const txBytes = fromBase64(parsed.data.txBytes)
+
+  try {
+    const simulation = await grpcClient.simulateTransaction({ transaction: txBytes })
+    if (simulation.$kind === 'FailedTransaction') {
+      return c.json({ error: `Simulation failed: ${simulation.FailedTransaction.status.error ?? 'unknown error'}` }, 400)
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Simulation failed.'
+    return c.json({ error: decodeURIComponent(message) }, 400)
+  }
+
   const result = await grpcClient.signAndExecuteTransaction({
     signer: keypair,
-    transaction: fromBase64(parsed.data.txBytes),
+    transaction: txBytes,
     additionalSignatures: [parsed.data.txSignature],
-  });
+  })
 
   if (waitForExecution) {
     await grpcClient.waitForTransaction({ result })

@@ -1,21 +1,5 @@
 {
-  "name": "suishin",
-  "type": "module",
-  "scripts": {
-    "dev:workers": "wrangler dev",
-    "dev:bun": "bun --env-file=.env src/bun.ts",
-    "deploy": "wrangler deploy --minify",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
-    "test": "bun test"
-  },
-  "dependencies": {
-    "@mysten/sui": "^2.5.0",
-    "envalid": "^8.1.1",
-    "hono": "^4.12.3",
-    "zod": "^4.3.6"
-  },
-  "devDependencies": {
-    "@types/bun": "^1.3.9",
-    "wrangler": "^4.69.0"
-  }
+  "name": "onara",
+  "private": true,
+  "workspaces": ["api", "sdk"]
 }
