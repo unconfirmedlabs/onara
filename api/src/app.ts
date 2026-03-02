@@ -5,6 +5,7 @@ import { Transaction } from '@mysten/sui/transactions'
 import { SuiGrpcClient } from '@mysten/sui/grpc'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
 import { fromBase64, isValidSuiAddress } from '@mysten/sui/utils'
+import pTimeout from 'p-timeout'
 import sponsorPoliciesConfig from '../policies'
 import { loadPolicies, validateSponsoredTxPayload } from './policy'
 
@@ -13,7 +14,10 @@ type Bindings = {
   SUI_NETWORK: string
   SUI_MNEMONIC: string
   DRY_RUN_ONLY?: string
+  EXECUTION_TIMEOUT_MS?: string
 }
+
+const DEFAULT_TIMEOUT_MS = 30_000
 
 const app = new Hono()
 
@@ -81,10 +85,15 @@ app.get('/refill/:coinId', async (c) => {
 })
 
 app.post('/sponsor', async (c) => {
-  const { DRY_RUN_ONLY } = env<Bindings>(c)
+  const { DRY_RUN_ONLY, EXECUTION_TIMEOUT_MS } = env<Bindings>(c)
   const parseBool = (v: string | undefined) => v === 'true' || v === '1'
   const waitForExecution = c.req.query('waitForExecution') !== 'false'
   const dryRun = !!DRY_RUN_ONLY || parseBool(c.req.query('dryRun'))
+  const serverExecutionTimeout = EXECUTION_TIMEOUT_MS ? Number(EXECUTION_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS
+  const callerExecutionTimeout = c.req.query('executionTimeoutMs') ? Number(c.req.query('executionTimeoutMs')) : undefined
+  const executionTimeoutMs = callerExecutionTimeout && callerExecutionTimeout > 0 && callerExecutionTimeout <= serverExecutionTimeout
+    ? callerExecutionTimeout
+    : serverExecutionTimeout
 
   const payload = (await c.req.json()) as {
     sender?: string
@@ -138,27 +147,40 @@ app.post('/sponsor', async (c) => {
 
   const txBytes = fromBase64(parsed.data.txBytes)
 
-  try {
-    const simulation = await grpcClient.simulateTransaction({ transaction: txBytes })
-    if (simulation.$kind === 'FailedTransaction') {
-      return c.json({ error: `Simulation failed: ${simulation.FailedTransaction.status.error ?? 'unknown error'}` }, 400)
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Simulation failed.'
-    return c.json({ error: decodeURIComponent(message) }, 400)
-  }
-
-  const result = await grpcClient.signAndExecuteTransaction({
-    signer: keypair,
-    transaction: txBytes,
-    additionalSignatures: [parsed.data.txSignature],
-  })
-
   if (waitForExecution) {
-    await grpcClient.waitForTransaction({ result })
+    try {
+      const simulation = await grpcClient.simulateTransaction({ transaction: txBytes })
+      if (simulation.$kind === 'FailedTransaction') {
+        return c.json({ error: `Simulation failed: ${simulation.FailedTransaction.status.error ?? 'unknown error'}` }, 400)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Simulation failed.'
+      return c.json({ error: decodeURIComponent(message) }, 400)
+    }
   }
 
-  return c.json(result)
+  try {
+    const result = await pTimeout(
+      grpcClient.signAndExecuteTransaction({
+        signer: keypair,
+        transaction: txBytes,
+        additionalSignatures: [parsed.data.txSignature],
+      }),
+      { milliseconds: executionTimeoutMs, message: 'Transaction execution timed out.' },
+    )
+
+    if (waitForExecution) {
+      await pTimeout(
+        grpcClient.waitForTransaction({ result }),
+        { milliseconds: executionTimeoutMs, message: 'Transaction confirmation timed out.' },
+      )
+    }
+
+    return c.json(result)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Transaction execution failed.'
+    return c.json({ error: message }, 500)
+  }
 })
 
 export default app
