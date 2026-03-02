@@ -1,16 +1,17 @@
 import { Hono } from 'hono'
 import { env } from 'hono/adapter'
 import { z } from 'zod'
-import { Transaction } from '@mysten/sui/transactions';
-import { SuiGrpcClient } from '@mysten/sui/grpc';
-import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { fromBase64, isValidSuiAddress, toBase64 } from '@mysten/sui/utils';
+import { Transaction } from '@mysten/sui/transactions'
+import { SuiGrpcClient } from '@mysten/sui/grpc'
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
+import { fromBase64, isValidSuiAddress } from '@mysten/sui/utils'
+import sponsorPoliciesConfig from '../policies'
+import { loadPolicies, validateSponsoredTxPayload } from './policy'
 
 type Bindings = {
   SUI_GRPC_URL: string
   SUI_NETWORK: string
   SUI_MNEMONIC: string
-  SUI_MNEMONIC_MOCK: string
 }
 
 const app = new Hono()
@@ -37,22 +38,7 @@ const sponsorPayloadSchema = z.object({
   txSignature: base64Field,
 })
 
-const buildSponsoredTxBytes = async ({
-  client,
-  txKindBytesBase64,
-  sender,
-  sponsorAddress,
-}: {
-  client: SuiGrpcClient
-  txKindBytesBase64: string
-  sender: string
-  sponsorAddress: string
-}) => {
-  const sponsoredTx = Transaction.fromKind(txKindBytesBase64)
-  sponsoredTx.setSender(sender)
-  sponsoredTx.setGasOwner(sponsorAddress)
-  return sponsoredTx.build({ client })
-}
+const SPONSORED_POLICIES = loadPolicies(sponsorPoliciesConfig)
 
 app.get('/status', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
@@ -61,20 +47,6 @@ app.get('/status', async (c) => {
     grpcUrl: SUI_GRPC_URL,
     address: getKeyPair(SUI_MNEMONIC).toSuiAddress(),
   })
-})
-
-app.get('/refill', async (c) => {
-  const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC_MOCK } = env<Bindings>(c)
-  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
-  const keypair = Ed25519Keypair.deriveKeypair(SUI_MNEMONIC_MOCK)
-  const tx = new Transaction()
-  tx.moveCall({
-    target: '0x2::coin::send_funds',
-    arguments: [tx.gas, tx.pure.address(keypair.toSuiAddress())],
-    typeArguments: ['0x2::sui::SUI']
-  })
-  const result = await grpcClient.signAndExecuteTransaction({ signer: keypair, transaction: tx })
-  return c.json(result)
 })
 
 app.get('/refill/:coinId', async (c) => {
@@ -89,49 +61,18 @@ app.get('/refill/:coinId', async (c) => {
   const keypair = Ed25519Keypair.deriveKeypair(SUI_MNEMONIC)
   const tx = new Transaction()
   tx.moveCall({
-    target: '0x2::coin::send_funds',
+    target: '0x0000000000000000000000000000000000000000000000000000000000000002::coin::send_funds',
     arguments: [tx.object(coinId), tx.pure.address(keypair.toSuiAddress())],
-    typeArguments: ['0x2::sui::SUI']
+    typeArguments: ['0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI']
   })
   const result = await grpcClient.signAndExecuteTransaction({ signer: keypair, transaction: tx })
   return c.json(result)
 })
 
-app.get("/mock", async (c) => {
-  const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC, SUI_MNEMONIC_MOCK } = env<Bindings>(c)
-  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
-  const keypair = getKeyPair(SUI_MNEMONIC)
-  const mockKeypair = Ed25519Keypair.deriveKeypair(SUI_MNEMONIC_MOCK)
-  const tx = new Transaction()
-  const coin = tx.moveCall({
-    target: '0x2::coin::zero',
-    arguments: [],
-    typeArguments: ['0x2::sui::SUI']
-  })
-  tx.moveCall(
-    {
-      target: '0x2::coin::destroy_zero',
-      arguments: [coin],
-      typeArguments: ['0x2::sui::SUI']
-    }
-  )
-  const kindBytes = await tx.build({ client: grpcClient, onlyTransactionKind: true });
-  const txBytes = await buildSponsoredTxBytes({
-    client: grpcClient,
-    txKindBytesBase64: toBase64(kindBytes),
-    sender: mockKeypair.toSuiAddress(),
-    sponsorAddress: keypair.toSuiAddress(),
-  })
-  const senderSignature = await mockKeypair.signTransaction(txBytes)
-  const payload = {
-    sender: mockKeypair.toSuiAddress(),
-    txBytes: toBase64(txBytes),
-    txSignature: senderSignature.signature,
-  }
-  return c.json(payload)
-})
-
 app.post('/sponsor', async (c) => {
+  const waitForExecution = z.coerce.boolean().parse(c.req.query('waitForExecution') ?? 'false')
+  const dryRun = z.coerce.boolean().parse(c.req.query('dryRun') ?? 'false')
+
   const payload = (await c.req.json()) as {
     sender?: string
     txBytes?: string
@@ -147,11 +88,50 @@ app.post('/sponsor', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
   const keypair = getKeyPair(SUI_MNEMONIC)
+  const sponsorAddress = keypair.toSuiAddress()
+  let calledTargets: string[] = []
+  let matchedPolicyName = ''
+
+  try {
+    const validation = validateSponsoredTxPayload({
+      txBytesBase64: parsed.data.txBytes,
+      expectedSender: parsed.data.sender,
+      expectedSponsor: sponsorAddress,
+      policies: SPONSORED_POLICIES,
+    })
+    calledTargets = validation.calledTargets
+    matchedPolicyName = validation.matchedPolicyName
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : 'Unable to validate sponsored transaction.'
+    return c.json({ error: message }, 400)
+  }
+
+  console.log(
+    JSON.stringify({
+      message: 'Sponsor request validated.',
+      sender: parsed.data.sender,
+      sponsor: sponsorAddress,
+      policy: matchedPolicyName,
+      moveCallTargets: calledTargets,
+    }),
+  )
+
+  if (dryRun) {
+    return c.json({ dryRun: true, policy: matchedPolicyName, moveCallTargets: calledTargets })
+  }
+
   const result = await grpcClient.signAndExecuteTransaction({
     signer: keypair,
     transaction: fromBase64(parsed.data.txBytes),
     additionalSignatures: [parsed.data.txSignature],
   });
+
+  if (waitForExecution) {
+    await grpcClient.waitForTransaction({ result })
+  }
 
   return c.json(result)
 })

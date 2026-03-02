@@ -6,15 +6,16 @@
     "dev:bun": "bun --env-file=.env src/bun.ts",
     "deploy": "wrangler deploy --minify",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
-    "load:sponsor": "node scripts/mock-sponsor-load.mjs"
+    "test": "bun test"
   },
   "dependencies": {
     "@mysten/sui": "^2.5.0",
     "envalid": "^8.1.1",
-    "hono": "^4.12.2",
+    "hono": "^4.12.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "wrangler": "^4.4.0"
+    "@types/bun": "^1.3.9",
+    "wrangler": "^4.69.0"
   }
 }
