@@ -67,8 +67,9 @@ async function main() {
     await writeFile(POLICIES_INDEX, generatedIndex)
     console.log('Generated policies/index.ts')
 
-    // Deploy
-    await run('npx', ['wrangler', 'deploy', '--minify', '--config', wranglerConfig], API_DIR)
+    // Deploy — use --cwd so wrangler resolves the entry point relative to API_DIR
+    // even when the config file lives in an external directory
+    await run('npx', ['wrangler', 'deploy', '--minify', '--config', wranglerConfig, '--cwd', API_DIR], API_DIR)
     console.log('Deploy complete.')
   } finally {
     // Restore original
