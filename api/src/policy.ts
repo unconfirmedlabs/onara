@@ -296,7 +296,7 @@ export type CompiledPolicy = {
   senders: Set<string> | null
   suinsNamePatterns: SuinsNamePattern[] | null
   gasBudgetMax: bigint | null
-  allowedCommandKinds: Set<string>
+  allowedCommandKinds: Set<string> | null
   maxCommands: number | null
 
   // Constraint mode
@@ -477,7 +477,7 @@ const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
     suinsNamePatterns,
     gasBudgetMax:
       raw.gasBudgetMax !== undefined ? BigInt(raw.gasBudgetMax) : null,
-    allowedCommandKinds: new Set(raw.allowedCommandKinds),
+    allowedCommandKinds: raw.allowedCommandKinds.includes('*') ? null : new Set(raw.allowedCommandKinds),
     maxCommands: raw.maxCommands ?? null,
     targetMatcher,
     callLimits,
@@ -831,10 +831,12 @@ export const validateSponsoredTxPayload = ({
         throw new Error(`too many commands (max ${policy.maxCommands})`)
       }
 
-      // allowedCommandKinds
-      for (const command of txData.commands) {
-        if (!policy.allowedCommandKinds.has(command.$kind)) {
-          throw new Error(`command kind not allowed: ${command.$kind}`)
+      // allowedCommandKinds (null = all allowed)
+      if (policy.allowedCommandKinds !== null) {
+        for (const command of txData.commands) {
+          if (!policy.allowedCommandKinds.has(command.$kind)) {
+            throw new Error(`command kind not allowed: ${command.$kind}`)
+          }
         }
       }
 
