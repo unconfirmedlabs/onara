@@ -4,7 +4,7 @@ Sui transaction sponsorship: a policy-based gas station server and TypeScript cl
 
 | Package | Description |
 |---|---|
-| [api/](./api) | Sponsorship server (Hono, runs on Bun / Cloudflare Workers) |
+| [api/](./api) | Sponsorship server (Hono on Cloudflare Workers) |
 | [sdk/](./sdk) | Client SDK (`onara` on npm) |
 
 ## Quick start

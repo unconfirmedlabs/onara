@@ -2,15 +2,15 @@
 
 Sui transaction sponsorship server with a declarative policy engine. Clients submit pre-built, pre-signed transactions; the server validates them against a set of JSON policies and, if approved, co-signs with the sponsor keypair and submits on-chain.
 
-Runs on **Bun** and **Cloudflare Workers**.
+Runs on **Cloudflare Workers**.
 
 ## Quick start
 
 ```bash
 bun install
 
-# Local development (reads .env)
-bun run dev:bun
+# Local development
+bun run dev
 
 # Run policy tests (offline, no gas costs)
 bun test
@@ -633,7 +633,6 @@ src/
   app.ts          Hono HTTP server — /status, /policies, /refill, /sponsor
   policy.ts       Policy engine — schema, compiler, validator
   policy.test.ts  Offline test suite (bun:test)
-  bun.ts          Bun entrypoint
   workers.ts      Cloudflare Workers entrypoint
 policies/
   index.ts        Policy registry
