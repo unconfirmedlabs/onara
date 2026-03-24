@@ -115,16 +115,22 @@ Returns the network, chain identifier, sponsor address, and balances.
 }
 ```
 
-- `active` — address balance (fund accumulator), available for sponsoring transactions
-- `pending` — coin balance, needs `/refill` to move into the active balance
+- `active` — address balance (balance accumulator), available for sponsoring transactions
+- `pending` — coin balance, not yet in the balance accumulator
+
+To fund the sponsor, send SUI to the balance accumulator using `coin::send_funds`:
+
+```bash
+sui client ptb \
+  --assign sponsor @0x<SPONSOR_ADDRESS> \
+  --split-coins gas "[200000000000]" \
+  --assign coin \
+  --move-call 0x2::coin::send_funds "<0x2::sui::SUI>" coin sponsor
+```
 
 ### `GET /policies`
 
 Returns the array of configured policy JSON configs.
-
-### `POST /refill`
-
-Scans all SUI coin objects owned by the sponsor and transfers them into the address balance (fund accumulator). Returns the number of coins refilled.
 
 ### `POST /sponsor`
 
@@ -630,7 +636,7 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 
 ```
 src/
-  app.ts          Hono HTTP server — /status, /policies, /refill, /sponsor
+  app.ts          Hono HTTP server — /status, /policies, /sponsor
   policy.ts       Policy engine — schema, compiler, validator
   policy.test.ts  Offline test suite (bun:test)
   workers.ts      Cloudflare Workers entrypoint

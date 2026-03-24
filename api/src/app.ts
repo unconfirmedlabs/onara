@@ -119,42 +119,7 @@ app.get('/policies', (c) => {
   return c.json(sponsorPoliciesConfig)
 })
 
-app.post('/refill', async (c) => {
-  const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
-  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
-  const keypair = getKeyPair(SUI_MNEMONIC)
-  const address = getSponsorAddress(SUI_MNEMONIC)
 
-  const SUI_TYPE = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI'
-  const coins: { objectId: string; balance: string }[] = []
-  let cursor: string | null = null
-
-  do {
-    const page = await grpcClient.listCoins({ owner: address, coinType: SUI_TYPE, cursor })
-    coins.push(...page.objects.map((coin) => ({ objectId: coin.objectId, balance: coin.balance })))
-    cursor = page.hasNextPage ? page.cursor : null
-  } while (cursor)
-
-  if (coins.length <= 1) {
-    return c.json({ message: 'No extra coins to refill.', coins: 0 })
-  }
-
-  // Skip the first coin — the SDK will auto-select it for gas payment.
-  // Send the remaining coins back to the address balance.
-  const tx = new Transaction()
-  for (const coin of coins.slice(1)) {
-    tx.moveCall({
-      target: `${SUI_TYPE.split('::')[0]}::coin::send_funds`,
-      arguments: [tx.object(coin.objectId), tx.pure.address(address)],
-      typeArguments: [SUI_TYPE],
-    })
-  }
-
-  const result = await grpcClient.signAndExecuteTransaction({ signer: keypair, transaction: tx })
-  await grpcClient.waitForTransaction({ result })
-
-  return c.json({ message: `Refilled ${coins.length} coin(s) to address balance.`, coins: coins.length, result })
-})
 
 app.post('/sponsor', async (c) => {
   const { DRY_RUN_ONLY, EXECUTION_TIMEOUT_MS, ANALYTICS, SUI_GRPC_URL } = env<Bindings>(c)
