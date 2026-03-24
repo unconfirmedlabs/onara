@@ -135,12 +135,14 @@ app.post('/refill', async (c) => {
     cursor = page.hasNextPage ? page.cursor : null
   } while (cursor)
 
-  if (coins.length === 0) {
-    return c.json({ message: 'No coins to refill.', coins: 0 })
+  if (coins.length <= 1) {
+    return c.json({ message: 'No extra coins to refill.', coins: 0 })
   }
 
+  // Skip the first coin — the SDK will auto-select it for gas payment.
+  // Send the remaining coins back to the address balance.
   const tx = new Transaction()
-  for (const coin of coins) {
+  for (const coin of coins.slice(1)) {
     tx.moveCall({
       target: `${SUI_TYPE.split('::')[0]}::coin::send_funds`,
       arguments: [tx.object(coin.objectId), tx.pure.address(address)],
