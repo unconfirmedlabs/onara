@@ -16,12 +16,15 @@ const getMoveCallTarget = ({
 
 // ─── Target Pattern System ───────────────────────────────────────────────────
 
+type UniversalPattern = { kind: 'universal' }
 type ExactPattern = { kind: 'exact'; target: string }
 type ModulePattern = { kind: 'module'; prefix: string }
 type PackagePattern = { kind: 'package'; prefix: string }
-type TargetPattern = ExactPattern | ModulePattern | PackagePattern
+type TargetPattern = UniversalPattern | ExactPattern | ModulePattern | PackagePattern
 
 const parseTargetPattern = (raw: string): TargetPattern => {
+  if (raw.trim() === '*') return { kind: 'universal' }
+
   const parts = raw.trim().split('::')
 
   if (parts.length === 2 && parts[1] === '*') {
@@ -55,18 +58,23 @@ const parseTargetPattern = (raw: string): TargetPattern => {
 }
 
 type TargetMatcher = {
+  matchAll: boolean
   exact: Set<string>
   modules: Set<string>
   packages: Set<string>
 }
 
 const buildTargetMatcher = (patterns: TargetPattern[]): TargetMatcher => {
+  let matchAll = false
   const exact = new Set<string>()
   const modules = new Set<string>()
   const packages = new Set<string>()
 
   for (const p of patterns) {
     switch (p.kind) {
+      case 'universal':
+        matchAll = true
+        break
       case 'exact':
         exact.add(p.target)
         break
@@ -79,10 +87,11 @@ const buildTargetMatcher = (patterns: TargetPattern[]): TargetMatcher => {
     }
   }
 
-  return { exact, modules, packages }
+  return { matchAll, exact, modules, packages }
 }
 
 const matchTarget = (target: string, matcher: TargetMatcher): boolean => {
+  if (matcher.matchAll) return true
   if (matcher.exact.size > 0 && matcher.exact.has(target)) return true
 
   if (matcher.modules.size > 0) {
@@ -98,6 +107,32 @@ const matchTarget = (target: string, matcher: TargetMatcher): boolean => {
   }
 
   return false
+}
+
+// ─── SuiNS Name Pattern System ───────────────────────────────────────────────
+
+type SuinsNamePattern =
+  | { kind: 'exact'; name: string }
+  | { kind: 'wildcard'; suffix: string }
+
+const parseSuinsNamePattern = (raw: string): SuinsNamePattern => {
+  const trimmed = raw.trim().toLowerCase()
+  if (trimmed.startsWith('*.')) {
+    return { kind: 'wildcard', suffix: trimmed.slice(1) } // e.g., ".sona.sui"
+  }
+  return { kind: 'exact', name: trimmed }
+}
+
+const matchSuinsName = (
+  name: string | null,
+  patterns: SuinsNamePattern[],
+): boolean => {
+  if (name === null) return false
+  const normalized = name.toLowerCase()
+  return patterns.some((p) => {
+    if (p.kind === 'exact') return normalized === p.name
+    return normalized.endsWith(p.suffix) && normalized.length > p.suffix.length
+  })
 }
 
 // ─── Zod Schemas ─────────────────────────────────────────────────────────────
@@ -163,8 +198,10 @@ const resultFlowRuleSchema = z.object({
 const policySchema = z
   .object({
     name: z.string().trim().min(1),
+    action: z.enum(['allow', 'deny']).default('allow'),
     enabled: z.boolean().default(true),
     senders: z.array(z.string().trim().min(1)).optional(),
+    suinsNames: z.array(z.string().trim().min(1)).optional(),
     gasBudgetMax: z.number().int().positive().optional(),
     allowedCommandKinds: z
       .array(z.string().trim().min(1))
@@ -190,13 +227,16 @@ const policySchema = z
   })
   .refine(
     (data) => {
+      // Deny policies don't require targets or sequence
+      if (data.action === 'deny') return true
+      // Allow policies require exactly one of targets or sequence
       const hasTargets = data.targets !== undefined
       const hasSequence = data.sequence !== undefined
       if (!hasTargets && !hasSequence) return false
       if (hasTargets && hasSequence) return false
       return true
     },
-    'Exactly one of targets or sequence is required.',
+    'Allow policies require exactly one of targets or sequence.',
   )
   .refine(
     (data) => {
@@ -207,6 +247,22 @@ const policySchema = z
       return true
     },
     'callLimits and ordering are only valid with targets mode.',
+  )
+  .refine(
+    (data) => {
+      if (data.action !== 'deny') return true
+      // Deny policies only support targets and senders
+      if (data.suinsNames !== undefined) return false
+      if (data.sequence !== undefined) return false
+      if (data.callLimits !== undefined) return false
+      if (data.ordering !== undefined) return false
+      if (data.resultFlow !== undefined) return false
+      if (data.typeArguments !== undefined) return false
+      if (data.maxCommands !== undefined) return false
+      if (data.gasBudgetMax !== undefined) return false
+      return true
+    },
+    'Deny policies only support targets and senders.',
   )
 
 // ─── Compiled Types ──────────────────────────────────────────────────────────
@@ -235,8 +291,10 @@ type CompiledSequenceStep = {
 
 export type CompiledPolicy = {
   name: string
+  action: 'allow' | 'deny'
   enabled: boolean
   senders: Set<string> | null
+  suinsNamePatterns: SuinsNamePattern[] | null
   gasBudgetMax: bigint | null
   allowedCommandKinds: Set<string>
   maxCommands: number | null
@@ -254,10 +312,17 @@ export type CompiledPolicy = {
   typeArguments: Map<string, Map<number, Set<string>>>
 }
 
+export type CompiledPolicies = {
+  deny: CompiledPolicy[]
+  allow: CompiledPolicy[]
+  needsSuinsResolution: boolean
+}
+
 // ─── Policy Compilation ──────────────────────────────────────────────────────
 
 const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
   const name = raw.name
+  const action = raw.action
 
   // Target matcher (constraint mode)
   let targetMatcher: TargetMatcher | null = null
@@ -268,6 +333,11 @@ const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
   // Senders
   const senders = raw.senders
     ? new Set(raw.senders.map((s) => normalizeSuiAddress(s)))
+    : null
+
+  // SuiNS name patterns
+  const suinsNamePatterns = raw.suinsNames
+    ? raw.suinsNames.map(parseSuinsNamePattern)
     : null
 
   // Call limits
@@ -401,8 +471,10 @@ const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
 
   return {
     name,
+    action,
     enabled: raw.enabled,
     senders,
+    suinsNamePatterns,
     gasBudgetMax:
       raw.gasBudgetMax !== undefined ? BigInt(raw.gasBudgetMax) : null,
     allowedCommandKinds: new Set(raw.allowedCommandKinds),
@@ -416,7 +488,7 @@ const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
   }
 }
 
-export const loadPolicies = (rawConfigs: unknown[]): CompiledPolicy[] => {
+export const loadPolicies = (rawConfigs: unknown[]): CompiledPolicies => {
   const parsed = z.array(policySchema).min(1).safeParse(rawConfigs)
   if (!parsed.success) {
     const issue =
@@ -425,13 +497,25 @@ export const loadPolicies = (rawConfigs: unknown[]): CompiledPolicy[] => {
   }
 
   const seenNames = new Set<string>()
-  return parsed.data.map((raw) => {
+  const deny: CompiledPolicy[] = []
+  const allow: CompiledPolicy[] = []
+
+  for (const raw of parsed.data) {
     if (seenNames.has(raw.name)) {
       throw new Error(`Duplicate sponsor policy name: ${raw.name}`)
     }
     seenNames.add(raw.name)
-    return compilePolicy(raw)
-  })
+    const compiled = compilePolicy(raw)
+    if (compiled.action === 'deny') {
+      deny.push(compiled)
+    } else {
+      allow.push(compiled)
+    }
+  }
+
+  const needsSuinsResolution = allow.some((p) => p.suinsNamePatterns !== null)
+
+  return { deny, allow, needsSuinsResolution }
 }
 
 // ─── Validation Helpers ──────────────────────────────────────────────────────
@@ -647,11 +731,13 @@ export const validateSponsoredTxPayload = ({
   expectedSender,
   expectedSponsor,
   policies,
+  senderName,
 }: {
   txBytesBase64: string
   expectedSender: string
   expectedSponsor: string
-  policies: CompiledPolicy[]
+  policies: CompiledPolicies
+  senderName?: string | null
 }) => {
   const tx = Transaction.from(txBytesBase64)
   const txData = tx.getData()
@@ -674,14 +760,62 @@ export const validateSponsoredTxPayload = ({
     )
   }
 
-  const policyErrors: string[] = []
+  // Extract move calls once for both deny and allow phases
+  const moveCalls: ParsedMoveCall[] = []
+  for (const [index, command] of txData.commands.entries()) {
+    if (command.$kind === 'MoveCall' && command.MoveCall) {
+      const mc = command.MoveCall
+      moveCalls.push({
+        index,
+        target: getMoveCallTarget({
+          packageId: mc.package,
+          module: mc.module,
+          functionName: mc.function,
+        }),
+        arguments: mc.arguments,
+        typeArguments: mc.typeArguments,
+      })
+    }
+  }
 
-  for (const policy of policies) {
-    // Soft skips — policy doesn't apply, try next without recording error
+  // Phase 1: Deny policies (any-match — reject if ANY call hits a denied target)
+  for (const policy of policies.deny) {
     if (!policy.enabled) continue
     if (
       policy.senders &&
       !policy.senders.has(normalizeSuiAddress(expectedSender))
+    )
+      continue
+
+    // No targets = deny all (scoped by sender if specified)
+    if (!policy.targetMatcher) {
+      throw new Error(`Transaction denied by policy: ${policy.name}`)
+    }
+
+    // Any-match: deny if ANY move call matches a denied target
+    const deniedCall = moveCalls.find((mc) =>
+      matchTarget(mc.target, policy.targetMatcher!),
+    )
+    if (deniedCall) {
+      throw new Error(
+        `Transaction denied by policy: ${policy.name} (matched ${deniedCall.target})`,
+      )
+    }
+  }
+
+  // Phase 2: Allow policies (first-match-wins, all calls must match)
+  const policyErrors: string[] = []
+
+  for (const policy of policies.allow) {
+    if (!policy.enabled) continue
+    if (
+      policy.senders &&
+      !policy.senders.has(normalizeSuiAddress(expectedSender))
+    )
+      continue
+    if (
+      policy.suinsNamePatterns &&
+      !matchSuinsName(senderName ?? null, policy.suinsNamePatterns)
     )
       continue
     if (policy.gasBudgetMax !== null && txData.gasData.budget) {
@@ -697,25 +831,10 @@ export const validateSponsoredTxPayload = ({
         throw new Error(`too many commands (max ${policy.maxCommands})`)
       }
 
-      // allowedCommandKinds + extract MoveCall data
-      const moveCalls: ParsedMoveCall[] = []
-      for (const [index, command] of txData.commands.entries()) {
+      // allowedCommandKinds
+      for (const command of txData.commands) {
         if (!policy.allowedCommandKinds.has(command.$kind)) {
           throw new Error(`command kind not allowed: ${command.$kind}`)
-        }
-
-        if (command.$kind === 'MoveCall' && command.MoveCall) {
-          const mc = command.MoveCall
-          moveCalls.push({
-            index,
-            target: getMoveCallTarget({
-              packageId: mc.package,
-              module: mc.module,
-              functionName: mc.function,
-            }),
-            arguments: mc.arguments,
-            typeArguments: mc.typeArguments,
-          })
         }
       }
 

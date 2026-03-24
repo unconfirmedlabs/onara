@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { Transaction } from '@mysten/sui/transactions'
 import { toBase64 } from '@mysten/sui/utils'
-import { loadPolicies, validateSponsoredTxPayload, type CompiledPolicy } from './policy'
+import { loadPolicies, validateSponsoredTxPayload, type CompiledPolicies } from './policy'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -44,14 +44,15 @@ async function buildTxBytes(
 
 function validate(
   txBytes: string,
-  policies: CompiledPolicy[],
-  opts?: { sender?: string; sponsor?: string },
+  policies: CompiledPolicies,
+  opts?: { sender?: string; sponsor?: string; senderName?: string | null },
 ) {
   return validateSponsoredTxPayload({
     txBytesBase64: txBytes,
     expectedSender: opts?.sender ?? SENDER,
     expectedSponsor: opts?.sponsor ?? SPONSOR,
     policies,
+    senderName: opts?.senderName,
   })
 }
 
@@ -545,5 +546,216 @@ describe('default policy integration', () => {
       `${SUI_PKG}::coin::zero`,
       `${SUI_PKG}::coin::destroy_zero`,
     ])
+  })
+})
+
+// ─── Universal wildcard ───────────────────────────────────────────────────────
+
+describe('allow-all policy (universal wildcard)', () => {
+  test('targets: ["*"] matches any transaction', async () => {
+    const policies = loadPolicies([{ name: 'allow-all', targets: ['*'] }])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::my_module::my_function` })
+    })
+    const result = validate(txBytes, policies)
+    expect(result.matchedPolicyName).toBe('allow-all')
+  })
+
+  test('targets: ["*"] matches multiple calls to different packages', async () => {
+    const policies = loadPolicies([{ name: 'allow-all', targets: ['*'] }])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod_a::fn_a` })
+      tx.moveCall({ target: `${SUI_PKG}::coin::zero` })
+    })
+    const result = validate(txBytes, policies)
+    expect(result.matchedPolicyName).toBe('allow-all')
+    expect(result.calledTargets).toHaveLength(2)
+  })
+})
+
+// ─── Deny policies ───────────────────────────────────────────────────────────
+
+const BAD_PKG = '0x0000000000000000000000000000000000000000000000000000000000000bad'
+
+describe('deny policies', () => {
+  test('deny by target blocks matching transaction', async () => {
+    const policies = loadPolicies([
+      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
+      { name: 'allow-all', targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${BAD_PKG}::exploit::drain` })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-bad/)
+  })
+
+  test('deny by sender blocks matching sender', async () => {
+    const policies = loadPolicies([
+      { name: 'block-sender', action: 'deny', senders: [SENDER] },
+      { name: 'allow-all', targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-sender/)
+  })
+
+  test('deny by sender does not affect other senders', async () => {
+    const otherSender = '0x0000000000000000000000000000000000000000000000000000000000000099'
+    const policies = loadPolicies([
+      { name: 'block-sender', action: 'deny', senders: [SENDER] },
+      { name: 'allow-all', targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes(
+      (tx) => { tx.moveCall({ target: `${PKG}::mod::fn` }) },
+      { sender: otherSender },
+    )
+    const result = validate(txBytes, policies, { sender: otherSender })
+    expect(result.matchedPolicyName).toBe('allow-all')
+  })
+
+  test('deny does not affect non-matching targets', async () => {
+    const policies = loadPolicies([
+      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
+      { name: 'allow-all', targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    const result = validate(txBytes, policies)
+    expect(result.matchedPolicyName).toBe('allow-all')
+  })
+
+  test('deny fires even when allow-all is listed first in config', async () => {
+    const policies = loadPolicies([
+      { name: 'allow-all', targets: ['*'] },
+      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${BAD_PKG}::exploit::drain` })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-bad/)
+  })
+
+  test('deny with any-match: blocks if ANY call matches denied target', async () => {
+    const policies = loadPolicies([
+      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
+      { name: 'allow-all', targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+      tx.moveCall({ target: `${BAD_PKG}::exploit::drain` })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-bad/)
+  })
+
+  test('deny rejects allow-only fields', () => {
+    expect(() => loadPolicies([
+      { name: 'bad-deny', action: 'deny', targets: ['*'], maxCommands: 5 },
+    ])).toThrow(/Deny policies only support targets and senders/)
+  })
+
+  test('deny rejects suinsNames', () => {
+    expect(() => loadPolicies([
+      { name: 'bad-deny', action: 'deny', suinsNames: ['*.evil.sui'] },
+    ])).toThrow(/Deny policies only support targets and senders/)
+  })
+})
+
+// ─── SuiNS name policies ─────────────────────────────────────────────────────
+
+describe('suinsNames policies', () => {
+  test('wildcard *.onara.sui matches alice.onara.sui', async () => {
+    const policies = loadPolicies([
+      { name: 'onara-community', suinsNames: ['*.onara.sui'], targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    const result = validate(txBytes, policies, { senderName: 'alice.onara.sui' })
+    expect(result.matchedPolicyName).toBe('onara-community')
+  })
+
+  test('wildcard *.onara.sui does NOT match onara.sui (DNS RFC 4592)', async () => {
+    const policies = loadPolicies([
+      { name: 'onara-community', suinsNames: ['*.onara.sui'], targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    expect(() =>
+      validate(txBytes, policies, { senderName: 'onara.sui' }),
+    ).toThrow(/did not match any sponsor policy/)
+  })
+
+  test('exact match onara.sui', async () => {
+    const policies = loadPolicies([
+      { name: 'onara-exact', suinsNames: ['onara.sui'], targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    const result = validate(txBytes, policies, { senderName: 'onara.sui' })
+    expect(result.matchedPolicyName).toBe('onara-exact')
+  })
+
+  test('combined wildcard + exact matches both', async () => {
+    const policies = loadPolicies([
+      { name: 'onara-all', suinsNames: ['*.onara.sui', 'onara.sui'], targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    expect(validate(txBytes, policies, { senderName: 'alice.onara.sui' }).matchedPolicyName).toBe('onara-all')
+    expect(validate(txBytes, policies, { senderName: 'onara.sui' }).matchedPolicyName).toBe('onara-all')
+  })
+
+  test('no SuiNS name soft-skips to next policy', async () => {
+    const policies = loadPolicies([
+      { name: 'onara-community', suinsNames: ['*.onara.sui'], targets: ['*'] },
+      { name: 'allow-all', targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    const result = validate(txBytes, policies, { senderName: null })
+    expect(result.matchedPolicyName).toBe('allow-all')
+  })
+
+  test('no SuiNS name with no fallback policy rejects', async () => {
+    const policies = loadPolicies([
+      { name: 'onara-only', suinsNames: ['*.onara.sui'], targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    expect(() =>
+      validate(txBytes, policies, { senderName: null }),
+    ).toThrow(/did not match any sponsor policy/)
+  })
+
+  test('case insensitive matching', async () => {
+    const policies = loadPolicies([
+      { name: 'onara-community', suinsNames: ['*.Sona.SUI'], targets: ['*'] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    const result = validate(txBytes, policies, { senderName: 'Alice.SONA.sui' })
+    expect(result.matchedPolicyName).toBe('onara-community')
+  })
+
+  test('needsSuinsResolution is true when a policy uses suinsNames', () => {
+    const policies = loadPolicies([
+      { name: 'onara', suinsNames: ['*.onara.sui'], targets: ['*'] },
+    ])
+    expect(policies.needsSuinsResolution).toBe(true)
+  })
+
+  test('needsSuinsResolution is false when no policy uses suinsNames', () => {
+    const policies = loadPolicies([
+      { name: 'allow-all', targets: ['*'] },
+    ])
+    expect(policies.needsSuinsResolution).toBe(false)
   })
 })

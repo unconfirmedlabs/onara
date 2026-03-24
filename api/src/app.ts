@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { env } from 'hono/adapter'
 import { z } from 'zod'
 import { Transaction } from '@mysten/sui/transactions'
@@ -6,8 +7,17 @@ import { SuiGrpcClient } from '@mysten/sui/grpc'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
 import { fromBase64, isValidSuiAddress } from '@mysten/sui/utils'
 import pTimeout from 'p-timeout'
-import sponsorPoliciesConfig from '../policies'
+import pRetry from 'p-retry'
 import { loadPolicies, validateSponsoredTxPayload } from './policy'
+import sponsorPoliciesConfig from '../policies'
+
+interface AnalyticsEngineDataset {
+  writeDataPoint(event: {
+    indexes?: string[]
+    blobs?: string[]
+    doubles?: number[]
+  }): void
+}
 
 type Bindings = {
   SUI_GRPC_URL: string
@@ -15,11 +25,14 @@ type Bindings = {
   SUI_MNEMONIC: string
   DRY_RUN_ONLY?: string
   EXECUTION_TIMEOUT_MS?: string
+  ANALYTICS?: AnalyticsEngineDataset
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
 
 const app = new Hono()
+
+app.use(cors())
 
 const getGrpcClient = (network: string, baseUrl: string) =>
   new SuiGrpcClient({
@@ -110,7 +123,7 @@ app.post('/refill', async (c) => {
 })
 
 app.post('/sponsor', async (c) => {
-  const { DRY_RUN_ONLY, EXECUTION_TIMEOUT_MS } = env<Bindings>(c)
+  const { DRY_RUN_ONLY, EXECUTION_TIMEOUT_MS, ANALYTICS, SUI_GRPC_URL } = env<Bindings>(c)
   const parseBool = (v: string | undefined) => v === 'true' || v === '1'
   const waitForExecution = c.req.query('waitForExecution') !== 'false'
   const dryRun = !!DRY_RUN_ONLY || parseBool(c.req.query('dryRun'))
@@ -132,19 +145,28 @@ app.post('/sponsor', async (c) => {
     return c.json({ error: issue }, 400)
   }
 
-  const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
+  const { SUI_NETWORK, SUI_MNEMONIC } = env<Bindings>(c)
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
   const keypair = getKeyPair(SUI_MNEMONIC)
   const sponsorAddress = keypair.toSuiAddress()
+
+  // Resolve SuiNS name only when a policy requires it
+  const senderName = SPONSORED_POLICIES.needsSuinsResolution
+    ? (await pRetry(
+        () => grpcClient.core.defaultNameServiceName({ address: parsed.data.sender }),
+        { retries: 1 },
+      )).data.name
+    : null
+
   let calledTargets: string[] = []
   let matchedPolicyName = ''
-
   try {
     const validation = validateSponsoredTxPayload({
       txBytesBase64: parsed.data.txBytes,
       expectedSender: parsed.data.sender,
       expectedSponsor: sponsorAddress,
       policies: SPONSORED_POLICIES,
+      senderName,
     })
     calledTargets = validation.calledTargets
     matchedPolicyName = validation.matchedPolicyName
@@ -172,9 +194,22 @@ app.post('/sponsor', async (c) => {
 
   const txBytes = fromBase64(parsed.data.txBytes)
 
+  // Parse transaction locally for analytics (gas budget, move call count)
+  const txData = Transaction.from(parsed.data.txBytes).getData()
+  const gasBudget = Number(txData.gasData.budget ?? 0)
+  const numMoveCalls = txData.commands.filter((cmd) => cmd.$kind === 'MoveCall').length
+
+  // Cloudflare request metadata
+  const cf = (c.req.raw as unknown as { cf?: Record<string, string> }).cf
+  const rpcNode = SUI_GRPC_URL.replace(/^https?:\/\//, '')
+  const userAgent = c.req.header('user-agent') ?? ''
+
   if (waitForExecution) {
     try {
-      const simulation = await grpcClient.simulateTransaction({ transaction: txBytes })
+      const simulation = await pRetry(
+        () => grpcClient.simulateTransaction({ transaction: txBytes }),
+        { retries: 1 },
+      )
       if (simulation.$kind === 'FailedTransaction') {
         return c.json({ error: `Simulation failed: ${simulation.FailedTransaction.status.error ?? 'unknown error'}` }, 400)
       }
@@ -184,13 +219,19 @@ app.post('/sponsor', async (c) => {
     }
   }
 
+  const startTime = Date.now()
+
   try {
     const result = await pTimeout(
-      grpcClient.signAndExecuteTransaction({
-        signer: keypair,
-        transaction: txBytes,
-        additionalSignatures: [parsed.data.txSignature],
-      }),
+      pRetry(
+        () => grpcClient.signAndExecuteTransaction({
+          signer: keypair,
+          transaction: txBytes,
+          additionalSignatures: [parsed.data.txSignature],
+          include: { effects: true },
+        }),
+        { retries: 1 },
+      ),
       { milliseconds: executionTimeoutMs, message: 'Transaction execution timed out.' },
     )
 
@@ -201,8 +242,66 @@ app.post('/sponsor', async (c) => {
       )
     }
 
+    const durationMs = Date.now() - startTime
+    const tx = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction
+    const gasUsed = tx?.effects?.gasUsed
+
+    ANALYTICS?.writeDataPoint({
+      indexes: [parsed.data.sender],
+      blobs: [
+        parsed.data.sender,           // blob1:  sender
+        tx?.epoch ?? '',               // blob2:  epoch
+        matchedPolicyName,             // blob3:  policy name
+        tx?.digest ?? '',              // blob4:  tx digest
+        rpcNode,                       // blob5:  RPC node
+        cf?.colo ?? '',                // blob6:  colo
+        cf?.country ?? '',             // blob7:  country
+        cf?.city ?? '',                // blob8:  city
+        cf?.continent ?? '',           // blob9:  continent
+        userAgent,                     // blob10: user agent
+      ],
+      doubles: [
+        result.$kind === 'Transaction' ? 1.0 : 0.0, // double1: success
+        1.0,                                          // double2: request count
+        durationMs,                                   // double3: execution duration (ms)
+        Number(gasUsed?.computationCost ?? 0),        // double4: computation cost
+        Number(gasUsed?.storageCost ?? 0),             // double5: storage cost
+        Number(gasUsed?.storageRebate ?? 0),           // double6: storage rebate
+        gasBudget,                                     // double7: gas budget
+        numMoveCalls,                                  // double8: num move calls
+      ],
+    })
+
     return c.json(result)
   } catch (error) {
+    const durationMs = Date.now() - startTime
+
+    ANALYTICS?.writeDataPoint({
+      indexes: [parsed.data.sender],
+      blobs: [
+        parsed.data.sender,           // blob1:  sender
+        '',                            // blob2:  epoch
+        matchedPolicyName,             // blob3:  policy name
+        '',                            // blob4:  tx digest
+        rpcNode,                       // blob5:  RPC node
+        cf?.colo ?? '',                // blob6:  colo
+        cf?.country ?? '',             // blob7:  country
+        cf?.city ?? '',                // blob8:  city
+        cf?.continent ?? '',           // blob9:  continent
+        userAgent,                     // blob10: user agent
+      ],
+      doubles: [
+        0.0,                           // double1: success
+        1.0,                           // double2: request count
+        durationMs,                    // double3: execution duration (ms)
+        0,                             // double4: computation cost
+        0,                             // double5: storage cost
+        0,                             // double6: storage rebate
+        gasBudget,                     // double7: gas budget
+        numMoveCalls,                  // double8: num move calls
+      ],
+    })
+
     const message = error instanceof Error ? error.message : 'Transaction execution failed.'
     return c.json({ error: message }, 500)
   }

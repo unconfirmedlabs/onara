@@ -32,6 +32,71 @@ bun run deploy
 | `DRY_RUN_ONLY` | When set, `/sponsor` always returns dry-run results |
 | `EXECUTION_TIMEOUT_MS` | Max execution time in ms (default: `30000`) |
 
+### Cloudflare bindings
+
+| Binding | Type | Description |
+|---|---|---|
+| `ANALYTICS` | Analytics Engine | Optional. When bound, writes sponsorship analytics per request. |
+
+To enable analytics, add the binding in `wrangler.jsonc`:
+
+```jsonc
+"analytics_engine_datasets": [
+  { "binding": "ANALYTICS", "dataset": "sponsorship" }
+]
+```
+
+## Deployment
+
+### Quick deploy (defaults)
+
+Deploy with the built-in `allow-all` policy and the in-tree `wrangler.jsonc`:
+
+```bash
+bun install
+wrangler secret put SUI_MNEMONIC
+bun run deploy
+```
+
+### Custom config
+
+For production deployments, create a config directory outside the repo:
+
+```
+my-onara-config/
+  wrangler.jsonc       # Your Cloudflare Worker config (domain, secrets, bindings)
+  policies/            # Your policy JSON files (all *.json files are loaded)
+    allow-all.json
+    deny-exploits.json
+    my-app-policy.json
+```
+
+Use `wrangler.example.jsonc` as a starting point:
+
+```bash
+cp api/wrangler.example.jsonc ~/my-onara-config/wrangler.jsonc
+```
+
+Deploy with the `--config` flag:
+
+```bash
+bun run deploy --config ~/my-onara-config
+```
+
+The deploy script reads all `*.json` files from `<config>/policies/`, generates the policy registry, deploys using your `wrangler.jsonc`, and restores the in-tree files afterward.
+
+### Updating
+
+Your config lives outside the repo, so pulling updates is clean:
+
+```bash
+git pull
+bun install
+bun run deploy --config ~/my-onara-config
+```
+
+No merge conflicts with policies or wrangler config.
+
 ## API
 
 ### `GET /status`
@@ -113,14 +178,28 @@ Policies are JSON files in the `policies/` directory, registered in `policies/in
 When a transaction arrives at `/sponsor`, the engine:
 
 1. Verifies the embedded sender and gas owner match the request
-2. Iterates policies in order, soft-skipping any that don't apply (disabled, sender restriction, gas budget)
-3. Validates the transaction against the first applicable policy
-4. Returns the matched policy name and called targets on success, or collects the error and tries the next policy
-5. If no policy matches, returns all collected errors
+2. Evaluates all **deny** policies first — if any match, the transaction is rejected immediately
+3. Evaluates **allow** policies in order, soft-skipping any that don't apply (disabled, sender restriction, gas budget)
+4. Validates the transaction against the first applicable allow policy
+5. Returns the matched policy name and called targets on success, or collects the error and tries the next policy
+6. If no allow policy matches, the transaction is rejected (deny by default)
 
-### Policy modes
+Deny policies are always evaluated before allow policies, regardless of their position in the config array. This prevents accidental misconfiguration where an allow-all rule overrides a deny rule.
 
-Each policy operates in exactly one of two modes:
+### Policy actions
+
+Each policy has an `action` field:
+
+- **`"allow"`** (default) — permits the transaction if it matches all constraints
+- **`"deny"`** — rejects the transaction if it matches
+
+Deny policies use **any-match** target semantics: a transaction is denied if ANY of its Move calls match a denied target. Allow policies use **all-match** semantics: ALL Move calls must be in the allowed target list.
+
+Deny policies only support `targets` and `senders`. Allow-only fields (suinsNames, callLimits, ordering, sequence, resultFlow, typeArguments, maxCommands, gasBudgetMax) are rejected at load time for deny policies.
+
+### Allow policy modes
+
+Each allow policy operates in exactly one of two modes:
 
 - **Constraint mode** (`targets`) — an unordered allowlist of Move call targets with optional call limits and ordering rules
 - **Sequence mode** (`sequence`) — an ordered list of steps that the transaction's commands must follow in order
@@ -131,11 +210,13 @@ Each policy operates in exactly one of two modes:
 {
   // Required
   "name": "unique-policy-name",
+  "action": "allow",                   // "allow" (default) or "deny"
 
   // Soft-skip controls (policy is silently skipped if these don't match)
   "enabled": true,                     // default: true
   "senders": ["0x<address>", ...],     // optional — restrict to specific senders
-  "gasBudgetMax": 50000000,            // optional — skip if tx gas budget exceeds this
+  "suinsNames": ["onara.sui", "*.onara.sui"], // optional — restrict to SuiNS name holders (allow only)
+  "gasBudgetMax": 50000000,            // optional — skip if tx gas budget exceeds this (allow only)
 
   // Hard limits (rejection, not skip)
   "maxCommands": 5,                    // optional — max total commands in the transaction
@@ -180,10 +261,11 @@ Each policy operates in exactly one of two modes:
 
 ### Target patterns
 
-Targets use the `package::module::function` format. Two wildcard forms are supported:
+Targets use the `package::module::function` format. Three wildcard forms are supported:
 
 | Pattern | Matches |
 |---|---|
+| `*` | Any target (universal wildcard) |
 | `0xPKG::module::function` | Exact match only |
 | `0xPKG::module::*` | Any function in the module |
 | `0xPKG::*` | Any module and function in the package |
@@ -222,11 +304,105 @@ These conditions cause a policy to be **silently skipped** (the engine moves to 
 
 - `enabled: false`
 - `senders` list doesn't include the transaction sender
+- `suinsNames` doesn't match the sender's SuiNS name (or sender has no name)
 - `gasBudgetMax` is exceeded by the transaction's gas budget
 
 Everything else (disallowed target, too many commands, wrong command kind, call limit violation, ordering violation, sequence mismatch, result flow violation, type argument mismatch) causes a **hard rejection** recorded as an error. If no policy matches after trying all, the collected errors are returned.
 
+### SuiNS name matching
+
+Allow policies can gate sponsorship by the sender's SuiNS name using `suinsNames`. When any loaded policy uses this field, the server resolves the sender's default SuiNS name via RPC before policy evaluation. When no policy uses `suinsNames`, no RPC call is made.
+
+Name patterns follow DNS wildcard conventions (RFC 4592):
+
+| Pattern | Matches | Does NOT match |
+|---|---|---|
+| `*.onara.sui` | `alice.onara.sui`, `bob.onara.sui` | `onara.sui` |
+| `onara.sui` | `onara.sui` | `alice.onara.sui` |
+| `*.sui` | Any `.sui` name | — |
+
+To match both a domain and its subdomains, list both:
+
+```json
+"suinsNames": ["onara.sui", "*.onara.sui"]
+```
+
+Matching is case-insensitive (`Alice.Onara.SUI` and `alice.onara.sui` are equivalent). If the sender's address doesn't resolve to a SuiNS name, policies with `suinsNames` are skipped and the engine tries the next policy — the sender isn't rejected unless no other policy matches.
+
+### Retry behavior
+
+The server retries transient failures on key RPC operations (1 retry, 2 attempts total):
+
+- **SuiNS name resolution** — only when a policy uses `suinsNames`
+- **Transaction simulation** — read-only, safe to retry
+- **Transaction execution** — Sui deduplicates by tx digest, safe to retry
+
+Each operation is still governed by the overall execution timeout (`EXECUTION_TIMEOUT_MS`).
+
 ## Policy examples
+
+### Allow all transactions
+
+The simplest policy — sponsors any transaction from anyone:
+
+```json
+{
+  "name": "allow-all",
+  "targets": ["*"]
+}
+```
+
+### Sponsor a SuiNS community
+
+Only sponsor transactions from senders with a `onara.sui` subdomain:
+
+```json
+{
+  "name": "onara-community",
+  "suinsNames": ["onara.sui", "*.onara.sui"],
+  "targets": ["*"]
+}
+```
+
+With no fallback allow-all policy, senders without a matching name are rejected by default.
+
+### Deny a specific package
+
+Block transactions that call a known-bad package, allow everything else:
+
+```json
+[
+  {
+    "name": "block-exploit",
+    "action": "deny",
+    "targets": ["0xBAD_PACKAGE::*"]
+  },
+  {
+    "name": "allow-all",
+    "targets": ["*"]
+  }
+]
+```
+
+The deny rule fires first regardless of array order.
+
+### Deny a specific sender
+
+Block a spammer, allow everyone else:
+
+```json
+[
+  {
+    "name": "block-spammer",
+    "action": "deny",
+    "senders": ["0xSPAMMER_ADDRESS"]
+  },
+  {
+    "name": "allow-all",
+    "targets": ["*"]
+  }
+]
+```
 
 ### 1. Simple token mint (constraint mode)
 
@@ -265,7 +441,7 @@ Only allow two specific addresses to interact with a DeFi module, capping gas at
 }
 ```
 
-### 3. Coin create-and-destroy with result flow (the default policy)
+### 3. Coin create-and-destroy with result flow
 
 Sponsor `coin::zero` followed by `coin::destroy_zero`, ensuring the zero coin is actually consumed:
 
@@ -368,10 +544,10 @@ Ensure every `borrow` is paired with a `repay`:
 2. Import it in `policies/index.ts` and add it to the array:
 
 ```typescript
-import defaultPolicy from './default.json'
+import allowAll from './allow-all.json'
 import myPolicy from './my-policy.json'
 
-const sponsorPolicies = [defaultPolicy, myPolicy]
+const sponsorPolicies = [allowAll, myPolicy]
 
 export default sponsorPolicies
 ```
@@ -379,7 +555,56 @@ export default sponsorPolicies
 3. Run `bun test` to make sure existing policies still load
 4. Optionally add dedicated tests in `src/policy.test.ts`
 
-Policy evaluation order matters — the first matching policy wins. Put more specific policies (with `senders`, `gasBudgetMax`, or narrow targets) before broader catch-all policies.
+Deny policies are always evaluated first regardless of array order. Within allow policies, evaluation order matters — the first matching allow policy wins. Put more specific allow policies (with `senders`, `gasBudgetMax`, or narrow targets) before broader catch-all policies.
+
+## Analytics
+
+When the `ANALYTICS` binding is configured, the server writes one data point per sponsored transaction to Cloudflare Workers Analytics Engine. Writes are fire-and-forget — they add no latency to the response.
+
+### Data model
+
+Each data point captures:
+
+| Blobs (strings) | Doubles (numbers) |
+|---|---|
+| sender address | success (1.0 / 0.0) |
+| epoch | request count (1.0) |
+| policy name | execution duration (ms) |
+| tx digest | computation cost (MIST) |
+| RPC node | storage cost (MIST) |
+| CF colo | storage rebate (MIST) |
+| country | gas budget (MIST) |
+| city | num move calls |
+| continent | |
+| user agent | |
+
+The sender address is used as the sampling index for accurate per-address analytics at scale.
+
+### Example queries
+
+```sql
+-- Total gas sponsored per sender
+SELECT blob1 AS sender,
+       SUM(_sample_interval * (double4 + double5 - double6)) AS total_gas
+FROM sponsorship
+WHERE timestamp >= NOW() - INTERVAL '30' DAY
+GROUP BY blob1 ORDER BY total_gas DESC
+
+-- Top countries by request volume
+SELECT blob7 AS country, SUM(_sample_interval * double2) AS requests
+FROM sponsorship
+WHERE timestamp >= NOW() - INTERVAL '7' DAY
+GROUP BY blob7 ORDER BY requests DESC
+
+-- Success rate over time
+SELECT intDiv(toUInt32(timestamp), 3600) * 3600 AS hour,
+       SUM(_sample_interval * double1) / SUM(_sample_interval * double2) AS success_rate
+FROM sponsorship
+WHERE timestamp >= NOW() - INTERVAL '24' HOUR
+GROUP BY hour ORDER BY hour
+```
+
+Query via the [Analytics Engine SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/). Data is retained for 3 months.
 
 ## Testing
 
@@ -392,23 +617,28 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 - Policy schema validation (invalid configs are rejected at load time)
 - Security checks (sender/sponsor mismatch detection)
 - Constraint mode (target matching, call limits, countMatch, ordering)
-- Wildcards (module and package level)
+- Wildcards (universal, module, and package level)
 - Sequence mode (step matching, count enforcement, extra command rejection)
 - Result flow (consumption tracking, required enforcement, disallowed consumer detection)
 - Type argument validation
-- Soft skip behavior (disabled, sender restriction, gas budget fallthrough)
+- Deny policies (target deny, sender deny, any-match semantics, order independence)
+- SuiNS name matching (wildcard, exact, DNS RFC 4592, case insensitivity, soft-skip)
+- Soft skip behavior (disabled, sender restriction, SuiNS name, gas budget fallthrough)
 - Integration test against the real `policies/default.json`
 
 ## Project structure
 
 ```
 src/
-  app.ts          Hono HTTP server — /status, /refill/:coinId, /sponsor
+  app.ts          Hono HTTP server — /status, /policies, /refill, /sponsor
   policy.ts       Policy engine — schema, compiler, validator
   policy.test.ts  Offline test suite (bun:test)
   bun.ts          Bun entrypoint
   workers.ts      Cloudflare Workers entrypoint
 policies/
   index.ts        Policy registry
-  default.json    Default coin::zero → coin::destroy_zero policy
+  allow-all.json  Default allow-all policy (universal wildcard)
+  default.json    Example coin::zero → coin::destroy_zero policy
+scripts/
+  deploy.ts       Deploy script (supports external config directory)
 ```
