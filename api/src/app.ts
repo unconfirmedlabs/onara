@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { timing, startTime, endTime } from 'hono/timing'
 import { env } from 'hono/adapter'
 import { z } from 'zod'
 import { Transaction } from '@mysten/sui/transactions'
@@ -33,15 +34,40 @@ const DEFAULT_TIMEOUT_MS = 30_000
 const app = new Hono()
 
 app.use(cors())
+app.use(timing())
 
-const getGrpcClient = (network: string, baseUrl: string) =>
-  new SuiGrpcClient({
-    network,
-    baseUrl,
-  })
+// Global variable cache — persists across requests within the same Worker instance.
+// Cloudflare Workers run one instance per edge node; global state survives between
+// invocations but is lost on eviction. We key by config to handle redeployments
+// that change env vars.
+let _grpcClient: SuiGrpcClient | null = null
+let _grpcClientKey = ''
 
-const getKeyPair = (mnemonic: string) =>
-  Ed25519Keypair.deriveKeypair(mnemonic)
+const getGrpcClient = (network: string, baseUrl: string): SuiGrpcClient => {
+  const key = `${network}:${baseUrl}`
+  if (_grpcClient && _grpcClientKey === key) return _grpcClient
+  _grpcClient = new SuiGrpcClient({ network, baseUrl })
+  _grpcClientKey = key
+  return _grpcClient
+}
+
+let _keypair: Ed25519Keypair | null = null
+let _keypairKey = ''
+let _sponsorAddress = ''
+
+const getKeyPair = (mnemonic: string): Ed25519Keypair => {
+  if (_keypair && _keypairKey === mnemonic) return _keypair
+  _keypair = Ed25519Keypair.deriveKeypair(mnemonic)
+  _keypairKey = mnemonic
+  _sponsorAddress = _keypair.toSuiAddress()
+  return _keypair
+}
+
+const getSponsorAddress = (mnemonic: string): string => {
+  if (_sponsorAddress && _keypairKey === mnemonic) return _sponsorAddress
+  getKeyPair(mnemonic)
+  return _sponsorAddress
+}
 
 const base64Regex = /^[A-Za-z0-9+/]+={0,2}$/
 const base64Field = z
@@ -60,15 +86,21 @@ const SPONSORED_POLICIES = loadPolicies(sponsorPoliciesConfig)
 
 app.get('/status', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
+
+  startTime(c, 'init', 'Client & keypair init')
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
-  const address = getKeyPair(SUI_MNEMONIC).toSuiAddress()
+  const address = getSponsorAddress(SUI_MNEMONIC)
+  endTime(c, 'init')
+
   let chainId: string | null = null
   let balances: { active: string; pending: string } | null = null
   try {
+    startTime(c, 'rpc', 'Chain ID & balance fetch')
     const [chainResult, balanceResult] = await Promise.all([
       grpcClient.core.getChainIdentifier(),
       grpcClient.getBalance({ owner: address }),
     ])
+    endTime(c, 'rpc')
     chainId = chainResult.chainIdentifier
     balances = {
       active: balanceResult.balance.addressBalance,
@@ -90,8 +122,8 @@ app.get('/policies', (c) => {
 app.post('/refill', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
-  const keypair = Ed25519Keypair.deriveKeypair(SUI_MNEMONIC)
-  const address = keypair.toSuiAddress()
+  const keypair = getKeyPair(SUI_MNEMONIC)
+  const address = getSponsorAddress(SUI_MNEMONIC)
 
   const SUI_TYPE = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI'
   const coins: { objectId: string; balance: string }[] = []
@@ -146,18 +178,24 @@ app.post('/sponsor', async (c) => {
   }
 
   const { SUI_NETWORK, SUI_MNEMONIC } = env<Bindings>(c)
+
+  startTime(c, 'init', 'Client & keypair init')
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
   const keypair = getKeyPair(SUI_MNEMONIC)
-  const sponsorAddress = keypair.toSuiAddress()
+  const sponsorAddress = getSponsorAddress(SUI_MNEMONIC)
+  endTime(c, 'init')
 
   // Resolve SuiNS name only when a policy requires it
+  startTime(c, 'suins', 'SuiNS resolution')
   const senderName = SPONSORED_POLICIES.needsSuinsResolution
     ? (await pRetry(
         () => grpcClient.core.defaultNameServiceName({ address: parsed.data.sender }),
         { retries: 1 },
       )).data.name
     : null
+  endTime(c, 'suins')
 
+  startTime(c, 'validate', 'Policy validation')
   let calledTargets: string[] = []
   let matchedPolicyName = ''
   try {
@@ -177,6 +215,7 @@ app.post('/sponsor', async (c) => {
         : 'Unable to validate sponsored transaction.'
     return c.json({ error: message }, 400)
   }
+  endTime(c, 'validate')
 
   console.log(
     JSON.stringify({
@@ -201,15 +240,17 @@ app.post('/sponsor', async (c) => {
 
   // Cloudflare request metadata
   const cf = (c.req.raw as unknown as { cf?: Record<string, string> }).cf
-  const rpcNode = SUI_GRPC_URL.replace(/^https?:\/\//, '')
+  const rpcNode = SUI_GRPC_URL
   const userAgent = c.req.header('user-agent') ?? ''
 
   if (waitForExecution) {
     try {
+      startTime(c, 'simulate', 'Transaction simulation')
       const simulation = await pRetry(
         () => grpcClient.simulateTransaction({ transaction: txBytes }),
         { retries: 1 },
       )
+      endTime(c, 'simulate')
       if (simulation.$kind === 'FailedTransaction') {
         return c.json({ error: `Simulation failed: ${simulation.FailedTransaction.status.error ?? 'unknown error'}` }, 400)
       }
@@ -219,9 +260,10 @@ app.post('/sponsor', async (c) => {
     }
   }
 
-  const startTime = Date.now()
+  const execStart = Date.now()
 
   try {
+    startTime(c, 'execute', 'Sign & execute transaction')
     const result = await pTimeout(
       pRetry(
         () => grpcClient.signAndExecuteTransaction({
@@ -241,8 +283,9 @@ app.post('/sponsor', async (c) => {
         { milliseconds: executionTimeoutMs, message: 'Transaction confirmation timed out.' },
       )
     }
+    endTime(c, 'execute')
 
-    const durationMs = Date.now() - startTime
+    const durationMs = Date.now() - execStart
     const tx = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction
     const gasUsed = tx?.effects?.gasUsed
 
@@ -274,7 +317,7 @@ app.post('/sponsor', async (c) => {
 
     return c.json(result)
   } catch (error) {
-    const durationMs = Date.now() - startTime
+    const durationMs = Date.now() - execStart
 
     ANALYTICS?.writeDataPoint({
       indexes: [parsed.data.sender],
