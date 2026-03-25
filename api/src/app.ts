@@ -27,6 +27,7 @@ type Bindings = {
   DRY_RUN_ONLY?: string
   EXECUTION_TIMEOUT_MS?: string
   ANALYTICS?: AnalyticsEngineDataset
+  HAYABUSA?: { fetch: typeof fetch }
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -35,6 +36,11 @@ const app = new Hono()
 
 app.use(cors())
 app.use(timing())
+app.use(async (c, next) => {
+  const { HAYABUSA } = env<Bindings>(c)
+  c.header('x-onara-transport', HAYABUSA ? 'hayabusa' : 'direct')
+  await next()
+})
 
 // Global variable cache — persists across requests within the same Worker instance.
 // Cloudflare Workers run one instance per edge node; global state survives between
@@ -43,10 +49,12 @@ app.use(timing())
 let _grpcClient: SuiGrpcClient | null = null
 let _grpcClientKey = ''
 
-const getGrpcClient = (network: string, baseUrl: string): SuiGrpcClient => {
-  const key = `${network}:${baseUrl}`
+const getGrpcClient = (network: string, baseUrl: string, serviceBinding?: { fetch: typeof fetch }): SuiGrpcClient => {
+  const key = serviceBinding ? `${network}:binding` : `${network}:${baseUrl}`
   if (_grpcClient && _grpcClientKey === key) return _grpcClient
-  _grpcClient = new SuiGrpcClient({ network, baseUrl })
+  _grpcClient = serviceBinding
+    ? new SuiGrpcClient({ network, baseUrl, fetch: (input, init) => serviceBinding.fetch(input, init) })
+    : new SuiGrpcClient({ network, baseUrl })
   _grpcClientKey = key
   return _grpcClient
 }
@@ -85,10 +93,10 @@ const sponsorPayloadSchema = z.object({
 const SPONSORED_POLICIES = loadPolicies(sponsorPoliciesConfig)
 
 app.get('/status', async (c) => {
-  const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC } = env<Bindings>(c)
+  const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC, HAYABUSA } = env<Bindings>(c)
 
   startTime(c, 'init', 'Client & keypair init')
-  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
+  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL, HAYABUSA)
   const address = getSponsorAddress(SUI_MNEMONIC)
   endTime(c, 'init')
 
@@ -112,6 +120,7 @@ app.get('/status', async (c) => {
     chainId,
     address,
     balances,
+    transport: HAYABUSA ? 'hayabusa' : 'direct',
   })
 })
 
@@ -144,10 +153,10 @@ app.post('/sponsor', async (c) => {
     return c.json({ error: issue }, 400)
   }
 
-  const { SUI_NETWORK, SUI_MNEMONIC } = env<Bindings>(c)
+  const { SUI_NETWORK, SUI_MNEMONIC, HAYABUSA } = env<Bindings>(c)
 
   startTime(c, 'init', 'Client & keypair init')
-  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL)
+  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL, HAYABUSA)
   const keypair = getKeyPair(SUI_MNEMONIC)
   const sponsorAddress = getSponsorAddress(SUI_MNEMONIC)
   endTime(c, 'init')
@@ -209,6 +218,11 @@ app.post('/sponsor', async (c) => {
   const cf = (c.req.raw as unknown as { cf?: Record<string, string> }).cf
   const rpcNode = SUI_GRPC_URL
   const userAgent = c.req.header('user-agent') ?? ''
+  const ip = c.req.header('cf-connecting-ip') ?? ''
+  const ipHash = ip
+    ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip))))
+        .map(b => b.toString(16).padStart(2, '0')).join('')
+    : ''
 
   if (waitForExecution) {
     try {
@@ -269,6 +283,7 @@ app.post('/sponsor', async (c) => {
         cf?.city ?? '',                // blob8:  city
         cf?.continent ?? '',           // blob9:  continent
         userAgent,                     // blob10: user agent
+        ipHash,                        // blob11: ip hash (sha-256)
       ],
       doubles: [
         result.$kind === 'Transaction' ? 1.0 : 0.0, // double1: success
@@ -299,6 +314,7 @@ app.post('/sponsor', async (c) => {
         cf?.city ?? '',                // blob8:  city
         cf?.continent ?? '',           // blob9:  continent
         userAgent,                     // blob10: user agent
+        ipHash,                        // blob11: ip hash (sha-256)
       ],
       doubles: [
         0.0,                           // double1: success
