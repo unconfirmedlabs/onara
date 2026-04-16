@@ -1,5 +1,5 @@
 {
-  "name": "@onara/api",
+  "name": "@unconfirmed/onara-api",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

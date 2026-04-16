@@ -1,17 +1,17 @@
-# @onara/sdk
+# @unconfirmed/onara
 
 TypeScript client SDK for [Onara](../api) — a Sui transaction sponsorship server.
 
 ## Install
 
 ```bash
-bun add @onara/sdk @mysten/sui
+bun add @unconfirmed/onara @mysten/sui
 ```
 
 ## Usage
 
 ```typescript
-import { OnaraClient } from '@onara/sdk'
+import { OnaraClient } from '@unconfirmed/onara'
 
 const onara = new OnaraClient('https://my-onara.example.com')
 

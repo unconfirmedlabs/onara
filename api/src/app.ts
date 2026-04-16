@@ -2,14 +2,16 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { timing, startTime, endTime } from 'hono/timing'
 import { env } from 'hono/adapter'
+import { upgradeWebSocket } from 'hono/cloudflare-workers'
 import { z } from 'zod'
 import { Transaction } from '@mysten/sui/transactions'
 import { SuiGrpcClient } from '@mysten/sui/grpc'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
 import { fromBase64, isValidSuiAddress } from '@mysten/sui/utils'
-import pTimeout from 'p-timeout'
 import pRetry from 'p-retry'
 import { loadPolicies, validateSponsoredTxPayload } from './policy'
+import { executeTransaction, type OnStatus, type SponsorEvent } from './execution'
+import { writeAnalytics } from './analytics'
 import sponsorPoliciesConfig from '../policies'
 
 interface AnalyticsEngineDataset {
@@ -26,11 +28,14 @@ type Bindings = {
   SUI_MNEMONIC: string
   DRY_RUN_ONLY?: string
   EXECUTION_TIMEOUT_MS?: string
+  CONFIRMATION_TIMEOUT_MS?: string
   ANALYTICS?: AnalyticsEngineDataset
   HAYABUSA?: { fetch: typeof fetch }
 }
 
-const DEFAULT_TIMEOUT_MS = 30_000
+const DEFAULT_EXECUTION_TIMEOUT_MS = 45_000
+const DEFAULT_CONFIRMATION_TIMEOUT_MS = 30_000
+const MAX_CALLER_TIMEOUT_MS = 60_000
 
 const app = new Hono()
 
@@ -53,10 +58,25 @@ const getGrpcClient = (network: string, baseUrl: string, serviceBinding?: { fetc
   const key = serviceBinding ? `${network}:binding` : `${network}:${baseUrl}`
   if (_grpcClient && _grpcClientKey === key) return _grpcClient
   _grpcClient = serviceBinding
-    ? new SuiGrpcClient({ network, baseUrl, fetch: (input, init) => serviceBinding.fetch(input, init) })
+    ? new SuiGrpcClient({ network, baseUrl, fetch: ((input, init) => serviceBinding.fetch(input, init)) as typeof fetch })
     : new SuiGrpcClient({ network, baseUrl })
   _grpcClientKey = key
   return _grpcClient
+}
+
+// Wraps a hayabusa service binding's fetch to capture the responding backend hash
+// and inject it as x-hayabusa-prefer-backend on subsequent calls. Scoped per
+// instance — create one per request so concurrent handlers don't share state.
+const createPinningFetch = (serviceBinding: { fetch: typeof fetch }): typeof fetch => {
+  let preferredBackend: string | null = null
+  return (async (input, init) => {
+    const headers = new Headers(init?.headers)
+    if (preferredBackend) headers.set('x-hayabusa-prefer-backend', preferredBackend)
+    const res = await serviceBinding.fetch(input, { ...init, headers })
+    const backend = res.headers.get('x-hayabusa-backend')
+    if (backend) preferredBackend = backend
+    return res
+  }) as typeof fetch
 }
 
 let _keypair: Ed25519Keypair | null = null
@@ -91,6 +111,28 @@ const sponsorPayloadSchema = z.object({
 })
 
 const SPONSORED_POLICIES = loadPolicies(sponsorPoliciesConfig)
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function resolveExecutionTimeout(bindings: Bindings, callerValue?: string): number {
+  const serverMax = bindings.EXECUTION_TIMEOUT_MS ? Number(bindings.EXECUTION_TIMEOUT_MS) : DEFAULT_EXECUTION_TIMEOUT_MS
+  const caller = callerValue ? Number(callerValue) : undefined
+  return caller && caller > 0 && caller <= MAX_CALLER_TIMEOUT_MS ? Math.min(caller, serverMax) : serverMax
+}
+
+function resolveConfirmationTimeout(bindings: Bindings, callerValue?: string): number {
+  const serverMax = bindings.CONFIRMATION_TIMEOUT_MS ? Number(bindings.CONFIRMATION_TIMEOUT_MS) : DEFAULT_CONFIRMATION_TIMEOUT_MS
+  const caller = callerValue ? Number(callerValue) : undefined
+  return caller && caller > 0 && caller <= MAX_CALLER_TIMEOUT_MS ? Math.min(caller, serverMax) : serverMax
+}
+
+function createGrpcClient(bindings: Bindings): SuiGrpcClient {
+  return bindings.HAYABUSA
+    ? new SuiGrpcClient({ network: bindings.SUI_NETWORK, baseUrl: bindings.SUI_GRPC_URL, fetch: createPinningFetch(bindings.HAYABUSA) })
+    : getGrpcClient(bindings.SUI_NETWORK, bindings.SUI_GRPC_URL)
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/status', async (c) => {
   const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC, HAYABUSA } = env<Bindings>(c)
@@ -128,18 +170,32 @@ app.get('/policies', (c) => {
   return c.json(sponsorPoliciesConfig)
 })
 
+// ─── Transaction status lookup ────────────────────────────────────────────────
 
+app.get('/sponsor/:digest/status', async (c) => {
+  const bindings = env<Bindings>(c)
+  const digest = c.req.param('digest')
+  const grpcClient = getGrpcClient(bindings.SUI_NETWORK, bindings.SUI_GRPC_URL, bindings.HAYABUSA)
+
+  try {
+    const tx = await grpcClient.getTransaction({ digest, include: { effects: true } })
+    return c.json({ found: true, ...tx })
+  } catch {
+    return c.json({ found: false, digest }, 404)
+  }
+})
+
+// ─── HTTP sponsorship ─────────────────────────────────────────────────────────
 
 app.post('/sponsor', async (c) => {
-  const { DRY_RUN_ONLY, EXECUTION_TIMEOUT_MS, ANALYTICS, SUI_GRPC_URL } = env<Bindings>(c)
+  const bindings = env<Bindings>(c)
+  const { DRY_RUN_ONLY, ANALYTICS, SUI_GRPC_URL } = bindings
   const parseBool = (v: string | undefined) => v === 'true' || v === '1'
   const waitForExecution = c.req.query('waitForExecution') !== 'false'
+  const simulate = c.req.query('simulate') !== 'false'
   const dryRun = !!DRY_RUN_ONLY || parseBool(c.req.query('dryRun'))
-  const serverExecutionTimeout = EXECUTION_TIMEOUT_MS ? Number(EXECUTION_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS
-  const callerExecutionTimeout = c.req.query('executionTimeoutMs') ? Number(c.req.query('executionTimeoutMs')) : undefined
-  const executionTimeoutMs = callerExecutionTimeout && callerExecutionTimeout > 0 && callerExecutionTimeout <= serverExecutionTimeout
-    ? callerExecutionTimeout
-    : serverExecutionTimeout
+  const executionTimeoutMs = resolveExecutionTimeout(bindings, c.req.query('executionTimeoutMs') ?? undefined)
+  const confirmationTimeoutMs = resolveConfirmationTimeout(bindings, c.req.query('confirmationTimeoutMs') ?? undefined)
 
   const payload = (await c.req.json()) as {
     sender?: string
@@ -153,12 +209,12 @@ app.post('/sponsor', async (c) => {
     return c.json({ error: issue }, 400)
   }
 
-  const { SUI_NETWORK, SUI_MNEMONIC, HAYABUSA } = env<Bindings>(c)
-
   startTime(c, 'init', 'Client & keypair init')
-  const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL, HAYABUSA)
-  const keypair = getKeyPair(SUI_MNEMONIC)
-  const sponsorAddress = getSponsorAddress(SUI_MNEMONIC)
+  // Fresh client per request when hayabusa is bound — pinning fetch holds per-request
+  // state to route follow-up reads to the same backend that saw the first response.
+  const grpcClient = createGrpcClient(bindings)
+  const keypair = getKeyPair(bindings.SUI_MNEMONIC)
+  const sponsorAddress = getSponsorAddress(bindings.SUI_MNEMONIC)
   endTime(c, 'init')
 
   // Resolve SuiNS name only when a policy requires it
@@ -224,7 +280,7 @@ app.post('/sponsor', async (c) => {
         .map(b => b.toString(16).padStart(2, '0')).join('')
     : ''
 
-  if (waitForExecution) {
+  if (simulate) {
     try {
       startTime(c, 'simulate', 'Transaction simulation')
       const simulation = await pRetry(
@@ -241,96 +297,244 @@ app.post('/sponsor', async (c) => {
     }
   }
 
-  const execStart = Date.now()
+  startTime(c, 'execute', 'Sign & execute transaction')
+  const outcome = await executeTransaction({
+    grpcClient,
+    keypair,
+    txBytes,
+    txSignature: parsed.data.txSignature,
+    waitForExecution,
+    executionTimeoutMs,
+    confirmationTimeoutMs,
+  })
+  endTime(c, 'execute')
 
-  try {
-    startTime(c, 'execute', 'Sign & execute transaction')
-    const result = await pTimeout(
-      pRetry(
-        () => grpcClient.signAndExecuteTransaction({
-          signer: keypair,
-          transaction: txBytes,
-          additionalSignatures: [parsed.data.txSignature],
-          include: { effects: true },
-        }),
-        { retries: 1 },
-      ),
-      { milliseconds: executionTimeoutMs, message: 'Transaction execution timed out.' },
-    )
+  const analyticsBase = {
+    dataset: ANALYTICS,
+    sender: parsed.data.sender,
+    policyName: matchedPolicyName,
+    rpcNode,
+    cf,
+    userAgent,
+    ipHash,
+    gasBudget,
+    numMoveCalls,
+  }
 
-    if (waitForExecution) {
-      await pTimeout(
-        grpcClient.waitForTransaction({ result }),
-        { milliseconds: executionTimeoutMs, message: 'Transaction confirmation timed out.' },
-      )
+  switch (outcome.kind) {
+    case 'success': {
+      const tx = outcome.result.$kind === 'Transaction' ? outcome.result.Transaction : outcome.result.FailedTransaction
+      writeAnalytics({
+        ...analyticsBase,
+        epoch: tx?.epoch ?? '',
+        digest: tx?.digest ?? '',
+        success: outcome.result.$kind === 'Transaction',
+        durationMs: outcome.durationMs,
+        gasUsed: tx?.effects?.gasUsed,
+      })
+      return c.json(outcome.result)
     }
-    endTime(c, 'execute')
 
-    const durationMs = Date.now() - execStart
-    const tx = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction
-    const gasUsed = tx?.effects?.gasUsed
+    case 'confirmation_timeout': {
+      const tx = outcome.result.$kind === 'Transaction' ? outcome.result.Transaction : outcome.result.FailedTransaction
+      writeAnalytics({
+        ...analyticsBase,
+        epoch: tx?.epoch ?? '',
+        digest: outcome.digest,
+        success: false,
+        durationMs: outcome.durationMs,
+        gasUsed: tx?.effects?.gasUsed,
+      })
+      return c.json({ error: outcome.error, digest: outcome.digest, status: 'unconfirmed' as const }, 504)
+    }
 
-    ANALYTICS?.writeDataPoint({
-      indexes: [parsed.data.sender],
-      blobs: [
-        parsed.data.sender,           // blob1:  sender
-        tx?.epoch ?? '',               // blob2:  epoch
-        matchedPolicyName,             // blob3:  policy name
-        tx?.digest ?? '',              // blob4:  tx digest
-        rpcNode,                       // blob5:  RPC node
-        cf?.colo ?? '',                // blob6:  colo
-        cf?.country ?? '',             // blob7:  country
-        cf?.city ?? '',                // blob8:  city
-        cf?.continent ?? '',           // blob9:  continent
-        userAgent,                     // blob10: user agent
-        ipHash,                        // blob11: ip hash (sha-256)
-      ],
-      doubles: [
-        result.$kind === 'Transaction' ? 1.0 : 0.0, // double1: success
-        1.0,                                          // double2: request count
-        durationMs,                                   // double3: execution duration (ms)
-        Number(gasUsed?.computationCost ?? 0),        // double4: computation cost
-        Number(gasUsed?.storageCost ?? 0),             // double5: storage cost
-        Number(gasUsed?.storageRebate ?? 0),           // double6: storage rebate
-        gasBudget,                                     // double7: gas budget
-        numMoveCalls,                                  // double8: num move calls
-      ],
-    })
-
-    return c.json(result)
-  } catch (error) {
-    const durationMs = Date.now() - execStart
-
-    ANALYTICS?.writeDataPoint({
-      indexes: [parsed.data.sender],
-      blobs: [
-        parsed.data.sender,           // blob1:  sender
-        '',                            // blob2:  epoch
-        matchedPolicyName,             // blob3:  policy name
-        '',                            // blob4:  tx digest
-        rpcNode,                       // blob5:  RPC node
-        cf?.colo ?? '',                // blob6:  colo
-        cf?.country ?? '',             // blob7:  country
-        cf?.city ?? '',                // blob8:  city
-        cf?.continent ?? '',           // blob9:  continent
-        userAgent,                     // blob10: user agent
-        ipHash,                        // blob11: ip hash (sha-256)
-      ],
-      doubles: [
-        0.0,                           // double1: success
-        1.0,                           // double2: request count
-        durationMs,                    // double3: execution duration (ms)
-        0,                             // double4: computation cost
-        0,                             // double5: storage cost
-        0,                             // double6: storage rebate
-        gasBudget,                     // double7: gas budget
-        numMoveCalls,                  // double8: num move calls
-      ],
-    })
-
-    const message = error instanceof Error ? error.message : 'Transaction execution failed.'
-    return c.json({ error: message }, 500)
+    case 'execution_timeout':
+    case 'execution_error': {
+      writeAnalytics({
+        ...analyticsBase,
+        epoch: '',
+        digest: '',
+        success: false,
+        durationMs: outcome.durationMs,
+        gasUsed: undefined,
+      })
+      const httpStatus = outcome.kind === 'execution_timeout' ? 504 : 500
+      return c.json({ error: outcome.error, status: 'unknown' as const }, httpStatus)
+    }
   }
 })
+
+// ─── WebSocket sponsorship ────────────────────────────────────────────────────
+
+app.get(
+  '/sponsor/ws',
+  upgradeWebSocket((c) => {
+    const bindings = env<Bindings>(c)
+
+    return {
+      onMessage: async (evt, ws) => {
+        const send = (event: SponsorEvent) => ws.send(JSON.stringify(event))
+
+        let payload: unknown
+        try {
+          payload = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data as ArrayBuffer))
+        } catch {
+          send({ status: 'error', error: 'Invalid JSON.' })
+          ws.close(1008)
+          return
+        }
+
+        send({ status: 'received' })
+
+        const parsed = sponsorPayloadSchema.safeParse(payload)
+        if (!parsed.success) {
+          send({ status: 'error', error: parsed.error.issues[0]?.message ?? 'Invalid request payload.' })
+          ws.close(1008)
+          return
+        }
+
+        const wsPayload = payload as Record<string, unknown>
+        const simulate = wsPayload.simulate !== false
+        const waitForExecution = wsPayload.waitForExecution !== false
+        const executionTimeoutMs = resolveExecutionTimeout(bindings)
+        const confirmationTimeoutMs = resolveConfirmationTimeout(bindings)
+
+        const grpcClient = createGrpcClient(bindings)
+        const keypair = getKeyPair(bindings.SUI_MNEMONIC)
+        const sponsorAddress = getSponsorAddress(bindings.SUI_MNEMONIC)
+
+        // SuiNS resolution
+        let senderName: string | null = null
+        if (SPONSORED_POLICIES.needsSuinsResolution) {
+          try {
+            senderName = (await pRetry(
+              () => grpcClient.core.defaultNameServiceName({ address: parsed.data.sender }),
+              { retries: 1 },
+            )).data.name
+          } catch (error) {
+            send({ status: 'error', error: 'SuiNS resolution failed.' })
+            ws.close(1011)
+            return
+          }
+        }
+
+        // Policy validation
+        send({ status: 'validating' })
+        let matchedPolicyName = ''
+        try {
+          const validation = validateSponsoredTxPayload({
+            txBytesBase64: parsed.data.txBytes,
+            expectedSender: parsed.data.sender,
+            expectedSponsor: sponsorAddress,
+            policies: SPONSORED_POLICIES,
+            senderName,
+          })
+          matchedPolicyName = validation.matchedPolicyName
+        } catch (error) {
+          send({ status: 'error', error: error instanceof Error ? error.message : 'Policy validation failed.' })
+          ws.close(1008)
+          return
+        }
+
+        const txBytes = fromBase64(parsed.data.txBytes)
+
+        // Simulation
+        if (simulate) {
+          send({ status: 'simulating' })
+          try {
+            const simulation = await pRetry(
+              () => grpcClient.simulateTransaction({ transaction: txBytes }),
+              { retries: 1 },
+            )
+            if (simulation.$kind === 'FailedTransaction') {
+              send({ status: 'error', error: `Simulation failed: ${simulation.FailedTransaction.status.error ?? 'unknown error'}` })
+              ws.close(1008)
+              return
+            }
+          } catch (error) {
+            send({ status: 'error', error: error instanceof Error ? error.message : 'Simulation failed.' })
+            ws.close(1011)
+            return
+          }
+        }
+
+        // Analytics prep
+        const txData = Transaction.from(parsed.data.txBytes).getData()
+        const gasBudget = Number(txData.gasData.budget ?? 0)
+        const numMoveCalls = txData.commands.filter((cmd) => cmd.$kind === 'MoveCall').length
+
+        // Execution with status callbacks
+        const outcome = await executeTransaction({
+          grpcClient,
+          keypair,
+          txBytes,
+          txSignature: parsed.data.txSignature,
+          waitForExecution,
+          executionTimeoutMs,
+          confirmationTimeoutMs,
+          onStatus: send,
+        })
+
+        const analyticsBase = {
+          dataset: bindings.ANALYTICS,
+          sender: parsed.data.sender,
+          policyName: matchedPolicyName,
+          rpcNode: bindings.SUI_GRPC_URL,
+          cf: undefined,
+          userAgent: '',
+          ipHash: '',
+          gasBudget,
+          numMoveCalls,
+        }
+
+        switch (outcome.kind) {
+          case 'success': {
+            const tx = outcome.result.$kind === 'Transaction' ? outcome.result.Transaction : outcome.result.FailedTransaction
+            writeAnalytics({
+              ...analyticsBase,
+              epoch: tx?.epoch ?? '',
+              digest: tx?.digest ?? '',
+              success: outcome.result.$kind === 'Transaction',
+              durationMs: outcome.durationMs,
+              gasUsed: tx?.effects?.gasUsed,
+            })
+            // confirmed event already sent by executeTransaction via onStatus
+            break
+          }
+          case 'confirmation_timeout': {
+            const tx = outcome.result.$kind === 'Transaction' ? outcome.result.Transaction : outcome.result.FailedTransaction
+            writeAnalytics({
+              ...analyticsBase,
+              epoch: tx?.epoch ?? '',
+              digest: outcome.digest,
+              success: false,
+              durationMs: outcome.durationMs,
+              gasUsed: tx?.effects?.gasUsed,
+            })
+            send({ status: 'error', error: outcome.error, digest: outcome.digest })
+            break
+          }
+          case 'execution_timeout':
+          case 'execution_error': {
+            writeAnalytics({
+              ...analyticsBase,
+              epoch: '',
+              digest: '',
+              success: false,
+              durationMs: outcome.durationMs,
+              gasUsed: undefined,
+            })
+            send({ status: 'error', error: outcome.error })
+            break
+          }
+        }
+
+        ws.close(1000)
+      },
+
+      onError: () => {},
+    }
+  }),
+)
 
 export default app
