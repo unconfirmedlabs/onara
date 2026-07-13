@@ -4,7 +4,7 @@ import type { SuiClientTypes } from '@mysten/sui/client'
 import pTimeout from 'p-timeout'
 import pRetry from 'p-retry'
 
-type TransactionResult = SuiClientTypes.TransactionResult<{ effects: true }>
+type TransactionResult = SuiClientTypes.TransactionResult<{ effects: true; events: true }>
 
 export type SponsorEventStatus =
   | 'received'
@@ -60,7 +60,7 @@ export async function executeTransaction(params: ExecutionParams): Promise<Execu
           signer: keypair,
           transaction: txBytes,
           additionalSignatures: [txSignature],
-          include: { effects: true },
+          include: { effects: true, events: true },
         }),
         { retries: 1 },
       ),

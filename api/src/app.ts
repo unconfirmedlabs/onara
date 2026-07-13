@@ -6,6 +6,7 @@ import { upgradeWebSocket } from 'hono/cloudflare-workers'
 import { z } from 'zod'
 import { Transaction } from '@mysten/sui/transactions'
 import { SuiGrpcClient } from '@mysten/sui/grpc'
+import { GrpcWebFetchTransport } from '@protobuf-ts/grpcweb-transport'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
 import { fromBase64, isValidSuiAddress } from '@mysten/sui/utils'
 import pRetry from 'p-retry'
@@ -57,9 +58,15 @@ let _grpcClientKey = ''
 const getGrpcClient = (network: string, baseUrl: string, serviceBinding?: { fetch: typeof fetch }): SuiGrpcClient => {
   const key = serviceBinding ? `${network}:binding` : `${network}:${baseUrl}`
   if (_grpcClient && _grpcClientKey === key) return _grpcClient
-  _grpcClient = serviceBinding
-    ? new SuiGrpcClient({ network, baseUrl, fetch: ((input, init) => serviceBinding.fetch(input, init)) as typeof fetch })
-    : new SuiGrpcClient({ network, baseUrl })
+  if (serviceBinding) {
+    const transport = new GrpcWebFetchTransport({
+      baseUrl,
+      fetch: ((input, init) => serviceBinding.fetch(input, init)) as typeof fetch,
+    })
+    _grpcClient = new SuiGrpcClient({ network, transport })
+  } else {
+    _grpcClient = new SuiGrpcClient({ network, baseUrl })
+  }
   _grpcClientKey = key
   return _grpcClient
 }
@@ -127,9 +134,14 @@ function resolveConfirmationTimeout(bindings: Bindings, callerValue?: string): n
 }
 
 function createGrpcClient(bindings: Bindings): SuiGrpcClient {
-  return bindings.HAYABUSA
-    ? new SuiGrpcClient({ network: bindings.SUI_NETWORK, baseUrl: bindings.SUI_GRPC_URL, fetch: createPinningFetch(bindings.HAYABUSA) })
-    : getGrpcClient(bindings.SUI_NETWORK, bindings.SUI_GRPC_URL)
+  if (!bindings.HAYABUSA) return getGrpcClient(bindings.SUI_NETWORK, bindings.SUI_GRPC_URL)
+  // SuiGrpcClient silently drops a top-level `fetch` option (v2.5.0), so pass
+  // the custom fetch via a pre-built GrpcWebFetchTransport instead.
+  const transport = new GrpcWebFetchTransport({
+    baseUrl: bindings.SUI_GRPC_URL,
+    fetch: createPinningFetch(bindings.HAYABUSA),
+  })
+  return new SuiGrpcClient({ network: bindings.SUI_NETWORK, transport })
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -178,7 +190,7 @@ app.get('/sponsor/:digest/status', async (c) => {
   const grpcClient = getGrpcClient(bindings.SUI_NETWORK, bindings.SUI_GRPC_URL, bindings.HAYABUSA)
 
   try {
-    const tx = await grpcClient.getTransaction({ digest, include: { effects: true } })
+    const tx = await grpcClient.getTransaction({ digest, include: { effects: true, events: true } })
     return c.json({ found: true, ...tx })
   } catch {
     return c.json({ found: false, digest }, 404)
