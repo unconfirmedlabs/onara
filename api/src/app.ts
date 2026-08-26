@@ -8,11 +8,29 @@ import { Transaction } from '@mysten/sui/transactions'
 import { SuiGrpcClient } from '@mysten/sui/grpc'
 import { GrpcWebFetchTransport } from '@protobuf-ts/grpcweb-transport'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
-import { fromBase64, isValidSuiAddress } from '@mysten/sui/utils'
+import { fromBase64, isValidSuiAddress, normalizeSuiAddress } from '@mysten/sui/utils'
 import pRetry from 'p-retry'
 import { loadPolicies, validateSponsoredTxPayload } from './policy'
+import {
+  assertSenderControlsOwnedInputs,
+  OwnedInputAuthorizationError,
+} from './input-authorization'
+import {
+  checkDynamicSender,
+  DynamicSenderDeniedError,
+  DynamicSenderUnavailableError,
+  type DynamicSendersCache,
+} from './dynamic-senders'
 import { executeTransaction, type OnStatus, type SponsorEvent } from './execution'
 import { writeAnalytics } from './analytics'
+import {
+  assertGasBudgetWithinCap,
+  assertRateLimits,
+  GasBudgetExceededError,
+  parseGasBudgetMax,
+  RateLimitedError,
+  type RateLimitBinding,
+} from './request-guards'
 import sponsorPoliciesConfig from '../policies'
 
 interface AnalyticsEngineDataset {
@@ -30,8 +48,12 @@ type Bindings = {
   DRY_RUN_ONLY?: string
   EXECUTION_TIMEOUT_MS?: string
   CONFIRMATION_TIMEOUT_MS?: string
+  GAS_BUDGET_MAX?: string
   ANALYTICS?: AnalyticsEngineDataset
   HAYABUSA?: { fetch: typeof fetch }
+  SENDER_RATE_LIMIT?: RateLimitBinding
+  IP_RATE_LIMIT?: RateLimitBinding
+  DYNAMIC_SENDERS_CACHE?: DynamicSendersCache
 }
 
 const DEFAULT_EXECUTION_TIMEOUT_MS = 45_000
@@ -144,6 +166,32 @@ function createGrpcClient(bindings: Bindings): SuiGrpcClient {
   return new SuiGrpcClient({ network: bindings.SUI_NETWORK, transport })
 }
 
+// Enforces the server-level GAS_BUDGET_MAX cap and the optional per-sender /
+// per-IP rate limit bindings. Shared by the HTTP and WebSocket transports.
+// Must run before policy matching, simulation, and signing.
+async function guardRequest({
+  bindings,
+  txBytesBase64,
+  sender,
+  ip,
+}: {
+  bindings: Bindings
+  txBytesBase64: string
+  sender: string
+  ip: string
+}): Promise<void> {
+  const gasBudgetMax = parseGasBudgetMax(bindings.GAS_BUDGET_MAX)
+  const txData = Transaction.from(txBytesBase64).getData()
+  assertGasBudgetWithinCap(txData.gasData.budget, gasBudgetMax)
+
+  await assertRateLimits({
+    senderLimiter: bindings.SENDER_RATE_LIMIT,
+    ipLimiter: bindings.IP_RATE_LIMIT,
+    sender: normalizeSuiAddress(sender),
+    ip,
+  })
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/status', async (c) => {
@@ -221,6 +269,31 @@ app.post('/sponsor', async (c) => {
     return c.json({ error: issue }, 400)
   }
 
+  // Server-level gas budget cap and per-sender/per-IP rate limits — enforced
+  // before policy matching, simulation, and signing.
+  startTime(c, 'guard', 'Gas budget cap & rate limiting')
+  try {
+    await guardRequest({
+      bindings,
+      txBytesBase64: parsed.data.txBytes,
+      sender: parsed.data.sender,
+      ip: c.req.header('cf-connecting-ip') ?? 'unknown',
+    })
+  } catch (error) {
+    if (error instanceof RateLimitedError) {
+      return c.json({ error: error.message }, 429)
+    }
+    if (error instanceof GasBudgetExceededError) {
+      return c.json({ error: error.message }, 400)
+    }
+    const message =
+      error instanceof Error
+        ? error.message
+        : 'Unable to validate sponsored transaction.'
+    return c.json({ error: message }, 400)
+  }
+  endTime(c, 'guard')
+
   startTime(c, 'init', 'Client & keypair init')
   // Fresh client per request when hayabusa is bound — pinning fetch holds per-request
   // state to route follow-up reads to the same backend that saw the first response.
@@ -242,6 +315,8 @@ app.post('/sponsor', async (c) => {
   startTime(c, 'validate', 'Policy validation')
   let calledTargets: string[] = []
   let matchedPolicyName = ''
+  let ownedInputIds: string[] = []
+  let matchedDynamicSenders: ReturnType<typeof validateSponsoredTxPayload>['dynamicSenders'] = null
   try {
     const validation = validateSponsoredTxPayload({
       txBytesBase64: parsed.data.txBytes,
@@ -252,6 +327,8 @@ app.post('/sponsor', async (c) => {
     })
     calledTargets = validation.calledTargets
     matchedPolicyName = validation.matchedPolicyName
+    ownedInputIds = validation.ownedInputIds
+    matchedDynamicSenders = validation.dynamicSenders
   } catch (error) {
     const message =
       error instanceof Error
@@ -260,6 +337,60 @@ app.post('/sponsor', async (c) => {
     return c.json({ error: message }, 400)
   }
   endTime(c, 'validate')
+
+  startTime(c, 'ownership', 'Owned input authorization')
+  try {
+    await assertSenderControlsOwnedInputs({
+      client: grpcClient,
+      sender: parsed.data.sender,
+      objectIds: ownedInputIds,
+    })
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : 'Unable to verify sponsored transaction object ownership.'
+    return c.json(
+      { error: message },
+      error instanceof OwnedInputAuthorizationError ? 400 : 503,
+    )
+  }
+  endTime(c, 'ownership')
+
+  if (matchedDynamicSenders) {
+    startTime(c, 'dynamicSenders', 'Dynamic sender check')
+    try {
+      const txData = Transaction.from(parsed.data.txBytes).getData()
+      await checkDynamicSender({
+        dynamicSenders: matchedDynamicSenders,
+        policyName: matchedPolicyName,
+        sender: normalizeSuiAddress(txData.sender!),
+        network: bindings.SUI_NETWORK,
+        env: bindings as Record<string, unknown>,
+        cache: bindings.DYNAMIC_SENDERS_CACHE,
+      })
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Dynamic sender check failed.'
+      console.error(
+        JSON.stringify({
+          message: 'Dynamic sender check failed.',
+          sender: parsed.data.sender,
+          policy: matchedPolicyName,
+          error: message,
+        }),
+      )
+      if (error instanceof DynamicSenderDeniedError) {
+        return c.json(
+          { error: `Sender not in dynamic whitelist for policy "${matchedPolicyName}"` },
+          403,
+        )
+      }
+      // DynamicSenderUnavailableError, or any unexpected failure — fail closed.
+      return c.json({ error: 'Dynamic sender check unavailable' }, 503)
+    }
+    endTime(c, 'dynamicSenders')
+  }
 
   console.log(
     JSON.stringify({
@@ -405,6 +536,27 @@ app.get(
           return
         }
 
+        // Server-level gas budget cap and per-sender/per-IP rate limits —
+        // enforced before policy matching, simulation, and signing.
+        try {
+          await guardRequest({
+            bindings,
+            txBytesBase64: parsed.data.txBytes,
+            sender: parsed.data.sender,
+            ip: c.req.header('cf-connecting-ip') ?? 'unknown',
+          })
+        } catch (error) {
+          send({
+            status: 'error',
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unable to validate sponsored transaction.',
+          })
+          ws.close(1008)
+          return
+        }
+
         const wsPayload = payload as Record<string, unknown>
         const simulate = wsPayload.simulate !== false
         const waitForExecution = wsPayload.waitForExecution !== false
@@ -433,6 +585,8 @@ app.get(
         // Policy validation
         send({ status: 'validating' })
         let matchedPolicyName = ''
+        let ownedInputIds: string[] = []
+        let matchedDynamicSenders: ReturnType<typeof validateSponsoredTxPayload>['dynamicSenders'] = null
         try {
           const validation = validateSponsoredTxPayload({
             txBytesBase64: parsed.data.txBytes,
@@ -442,10 +596,67 @@ app.get(
             senderName,
           })
           matchedPolicyName = validation.matchedPolicyName
+          ownedInputIds = validation.ownedInputIds
+          matchedDynamicSenders = validation.dynamicSenders
         } catch (error) {
           send({ status: 'error', error: error instanceof Error ? error.message : 'Policy validation failed.' })
           ws.close(1008)
           return
+        }
+
+        try {
+          await assertSenderControlsOwnedInputs({
+            client: grpcClient,
+            sender: parsed.data.sender,
+            objectIds: ownedInputIds,
+          })
+        } catch (error) {
+          send({
+            status: 'error',
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unable to verify sponsored transaction object ownership.',
+          })
+          ws.close(error instanceof OwnedInputAuthorizationError ? 1008 : 1011)
+          return
+        }
+
+        if (matchedDynamicSenders) {
+          try {
+            const txData = Transaction.from(parsed.data.txBytes).getData()
+            await checkDynamicSender({
+              dynamicSenders: matchedDynamicSenders,
+              policyName: matchedPolicyName,
+              sender: normalizeSuiAddress(txData.sender!),
+              network: bindings.SUI_NETWORK,
+              env: bindings as Record<string, unknown>,
+              cache: bindings.DYNAMIC_SENDERS_CACHE,
+            })
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : 'Dynamic sender check failed.'
+            console.error(
+              JSON.stringify({
+                message: 'Dynamic sender check failed.',
+                sender: parsed.data.sender,
+                policy: matchedPolicyName,
+                error: message,
+              }),
+            )
+            if (error instanceof DynamicSenderDeniedError) {
+              send({
+                status: 'error',
+                error: `Sender not in dynamic whitelist for policy "${matchedPolicyName}"`,
+              })
+              ws.close(1008)
+              return
+            }
+            // DynamicSenderUnavailableError, or any unexpected failure — fail closed.
+            send({ status: 'error', error: 'Dynamic sender check unavailable' })
+            ws.close(1011)
+            return
+          }
         }
 
         const txBytes = fromBase64(parsed.data.txBytes)

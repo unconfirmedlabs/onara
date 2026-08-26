@@ -1,6 +1,11 @@
 import { z } from 'zod'
 import { Transaction } from '@mysten/sui/transactions'
-import { normalizeSuiAddress, isValidSuiAddress } from '@mysten/sui/utils'
+import {
+  normalizeStructTag,
+  normalizeSuiAddress,
+  normalizeSuiObjectId,
+  isValidSuiAddress,
+} from '@mysten/sui/utils'
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -22,35 +27,37 @@ type ModulePattern = { kind: 'module'; prefix: string }
 type PackagePattern = { kind: 'package'; prefix: string }
 type TargetPattern = UniversalPattern | ExactPattern | ModulePattern | PackagePattern
 
+const normalizePackageAddress = (raw: string, pattern: string): string => {
+  const normalized = normalizeSuiAddress(raw)
+  if (!isValidSuiAddress(normalized)) {
+    throw new Error(`Invalid package address in pattern: ${pattern}`)
+  }
+  return normalized
+}
+
 const parseTargetPattern = (raw: string): TargetPattern => {
   if (raw.trim() === '*') return { kind: 'universal' }
 
   const parts = raw.trim().split('::')
 
   if (parts.length === 2 && parts[1] === '*') {
-    const addr = parts[0]!
-    if (!isValidSuiAddress(addr)) {
-      throw new Error(`Invalid package address in pattern: ${raw}`)
+    return {
+      kind: 'package',
+      prefix: normalizePackageAddress(parts[0]!, raw),
     }
-    return { kind: 'package', prefix: normalizeSuiAddress(addr) }
   }
 
   if (parts.length === 3 && parts[2] === '*') {
-    const addr = parts[0]!
-    if (!isValidSuiAddress(addr)) {
-      throw new Error(`Invalid package address in pattern: ${raw}`)
+    return {
+      kind: 'module',
+      prefix: `${normalizePackageAddress(parts[0]!, raw)}::${parts[1]}`,
     }
-    return { kind: 'module', prefix: `${normalizeSuiAddress(addr)}::${parts[1]}` }
   }
 
   if (parts.length === 3) {
-    const addr = parts[0]!
-    if (!isValidSuiAddress(addr)) {
-      throw new Error(`Invalid package address in target: ${raw}`)
-    }
     return {
       kind: 'exact',
-      target: `${normalizeSuiAddress(addr)}::${parts[1]}::${parts[2]}`,
+      target: `${normalizePackageAddress(parts[0]!, raw)}::${parts[1]}::${parts[2]}`,
     }
   }
 
@@ -195,12 +202,63 @@ const resultFlowRuleSchema = z.object({
   required: z.boolean().default(true),
 })
 
+const isLocalHostname = (hostname: string): boolean =>
+  hostname === 'localhost' || hostname === '127.0.0.1'
+
+const dynamicSenderConfigSchema = z
+  .object({
+    url: z.string().trim().min(1),
+    timeoutMs: z.number().int().positive().default(1500),
+    // Cloudflare KV rejects expirationTtl < 60; 0 disables caching.
+    cacheTtlSeconds: z
+      .number()
+      .int()
+      .nonnegative()
+      .default(0)
+      .refine(
+        (ttl) => ttl === 0 || ttl >= 60,
+        'senders.dynamic.cacheTtlSeconds must be 0 or at least 60.',
+      ),
+    secretEnv: z.string().trim().min(1).default('DYNAMIC_SENDERS_SECRET'),
+  })
+  .strict()
+  .refine(
+    (data) => {
+      let parsedUrl: URL
+      try {
+        parsedUrl = new URL(data.url)
+      } catch {
+        return false
+      }
+      if (parsedUrl.protocol === 'https:') return true
+      return parsedUrl.protocol === 'http:' && isLocalHostname(parsedUrl.hostname)
+    },
+    'senders.dynamic.url must be https:// (http:// is only allowed for localhost/127.0.0.1).',
+  )
+
+export type DynamicSendersConfig = z.infer<typeof dynamicSenderConfigSchema>
+
+// `senders` is an object with a `static` address list, a `dynamic` endpoint
+// config, or both — at least one is required.
+const sendersSchema = z
+  .object({
+    static: z.array(z.string().trim().min(1)).min(1).optional(),
+    dynamic: dynamicSenderConfigSchema.optional(),
+  })
+  .strict()
+  .refine(
+    (data) => data.static !== undefined || data.dynamic !== undefined,
+    'senders requires at least one of static or dynamic.',
+  )
+
+export type SendersConfig = z.infer<typeof sendersSchema>
+
 const policySchema = z
   .object({
     name: z.string().trim().min(1),
     action: z.enum(['allow', 'deny']).default('allow'),
     enabled: z.boolean().default(true),
-    senders: z.array(z.string().trim().min(1)).optional(),
+    senders: sendersSchema.optional(),
     suinsNames: z.array(z.string().trim().min(1)).optional(),
     gasBudgetMax: z.number().int().positive().optional(),
     allowedCommandKinds: z
@@ -260,6 +318,7 @@ const policySchema = z
       if (data.typeArguments !== undefined) return false
       if (data.maxCommands !== undefined) return false
       if (data.gasBudgetMax !== undefined) return false
+      if (data.senders?.dynamic !== undefined) return false
       return true
     },
     'Deny policies only support targets and senders.',
@@ -289,11 +348,19 @@ type CompiledSequenceStep = {
   max: number
 }
 
+// Compiled `senders`: a static address set and/or a dynamic endpoint config.
+// At least one is non-null whenever the compiled value itself is non-null
+// (enforced by `sendersObjectSchema`'s refine).
+export type CompiledSenders = {
+  static: Set<string> | null
+  dynamic: DynamicSendersConfig | null
+}
+
 export type CompiledPolicy = {
   name: string
   action: 'allow' | 'deny'
   enabled: boolean
-  senders: Set<string> | null
+  senders: CompiledSenders | null
   suinsNamePatterns: SuinsNamePattern[] | null
   gasBudgetMax: bigint | null
   allowedCommandKinds: Set<string> | null
@@ -310,6 +377,19 @@ export type CompiledPolicy = {
   // Both modes
   resultFlowRules: CompiledResultFlowRule[]
   typeArguments: Map<string, Map<number, Set<string>>>
+}
+
+// True when a sender should not be filtered out of policy matching at the
+// soft-skip stage. A dynamic-senders policy always passes here — the actual
+// allow/deny decision (static hit, or the HTTP check) happens after the
+// policy has otherwise matched, since it may require an async HTTP call.
+const passesSenderGate = (
+  senders: CompiledSenders | null,
+  normalizedSender: string,
+): boolean => {
+  if (!senders) return true
+  if (senders.dynamic) return true
+  return senders.static ? senders.static.has(normalizedSender) : true
 }
 
 export type CompiledPolicies = {
@@ -331,8 +411,13 @@ const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
   }
 
   // Senders
-  const senders = raw.senders
-    ? new Set(raw.senders.map((s) => normalizeSuiAddress(s)))
+  const senders: CompiledSenders | null = raw.senders
+    ? {
+        static: raw.senders.static
+          ? new Set(raw.senders.static.map((s) => normalizeSuiAddress(s)))
+          : null,
+        dynamic: raw.senders.dynamic ?? null,
+      }
     : null
 
   // SuiNS name patterns
@@ -463,7 +548,10 @@ const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
             `${name}: invalid type argument index: ${indexStr}`,
           )
         }
-        argMap.set(index, new Set(allowedTypes))
+        argMap.set(
+          index,
+          new Set(allowedTypes.map((type) => normalizeStructTag(type))),
+        )
       }
       typeArguments.set(parsed.target, argMap)
     }
@@ -554,6 +642,13 @@ const getReferencedResultProducerIndex = (argument: unknown): number | null => {
   }
 
   return null
+}
+
+const referencesGasCoin = (value: unknown): boolean => {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  if (record.$kind === 'GasCoin' || record.GasCoin === true) return true
+  return Object.values(record).some(referencesGasCoin)
 }
 
 const validateConstraintMode = (
@@ -742,22 +837,49 @@ export const validateSponsoredTxPayload = ({
   const tx = Transaction.from(txBytesBase64)
   const txData = tx.getData()
 
+  if (!txData.sender) {
+    throw new Error('Sponsored transaction is missing its sender.')
+  }
   if (
-    txData.sender &&
-    normalizeSuiAddress(txData.sender) !==
-      normalizeSuiAddress(expectedSender)
+    normalizeSuiAddress(txData.sender) !== normalizeSuiAddress(expectedSender)
   ) {
     throw new Error('Transaction sender does not match payload sender.')
   }
 
+  if (!txData.gasData.owner) {
+    throw new Error('Sponsored transaction is missing its gas owner.')
+  }
   if (
-    txData.gasData.owner &&
     normalizeSuiAddress(txData.gasData.owner) !==
       normalizeSuiAddress(expectedSponsor)
   ) {
     throw new Error(
       'Transaction gas owner does not match configured sponsor.',
     )
+  }
+
+  const ownedInputIds: string[] = []
+  for (const input of txData.inputs) {
+    if (input.$kind === 'FundsWithdrawal') {
+      if (input.FundsWithdrawal.withdrawFrom.$kind !== 'Sender') {
+        throw new Error(
+          'Sponsored transactions may only withdraw sender funds.',
+        )
+      }
+      continue
+    }
+    if (
+      input.$kind === 'Object' &&
+      input.Object.$kind === 'ImmOrOwnedObject'
+    ) {
+      ownedInputIds.push(
+        normalizeSuiObjectId(input.Object.ImmOrOwnedObject.objectId),
+      )
+    }
+  }
+
+  if (txData.commands.some(referencesGasCoin)) {
+    throw new Error('Sponsored transaction commands may not use GasCoin.')
   }
 
   // Extract move calls once for both deny and allow phases
@@ -773,19 +895,19 @@ export const validateSponsoredTxPayload = ({
           functionName: mc.function,
         }),
         arguments: mc.arguments,
-        typeArguments: mc.typeArguments,
+        typeArguments: mc.typeArguments.map((type) =>
+          normalizeStructTag(type),
+        ),
       })
     }
   }
 
+  const normalizedExpectedSender = normalizeSuiAddress(expectedSender)
+
   // Phase 1: Deny policies (any-match — reject if ANY call hits a denied target)
   for (const policy of policies.deny) {
     if (!policy.enabled) continue
-    if (
-      policy.senders &&
-      !policy.senders.has(normalizeSuiAddress(expectedSender))
-    )
-      continue
+    if (!passesSenderGate(policy.senders, normalizedExpectedSender)) continue
 
     // No targets = deny all (scoped by sender if specified)
     if (!policy.targetMatcher) {
@@ -808,11 +930,7 @@ export const validateSponsoredTxPayload = ({
 
   for (const policy of policies.allow) {
     if (!policy.enabled) continue
-    if (
-      policy.senders &&
-      !policy.senders.has(normalizeSuiAddress(expectedSender))
-    )
-      continue
+    if (!passesSenderGate(policy.senders, normalizedExpectedSender)) continue
     if (
       policy.suinsNamePatterns &&
       !matchSuinsName(senderName ?? null, policy.suinsNamePatterns)
@@ -860,9 +978,21 @@ export const validateSponsoredTxPayload = ({
       // Result flow
       validateResultFlow(policy, moveCalls)
 
+      // If the policy has a dynamic sender check, it only needs to run when
+      // the sender isn't already covered by the static list — a static hit
+      // is a free allow, no HTTP call required.
+      let dynamicSenders: DynamicSendersConfig | null = null
+      if (policy.senders?.dynamic) {
+        const inStatic =
+          policy.senders.static?.has(normalizedExpectedSender) ?? false
+        if (!inStatic) dynamicSenders = policy.senders.dynamic
+      }
+
       return {
         calledTargets: moveCalls.map((mc) => mc.target),
         matchedPolicyName: policy.name,
+        ownedInputIds: [...new Set(ownedInputIds)],
+        dynamicSenders,
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error'

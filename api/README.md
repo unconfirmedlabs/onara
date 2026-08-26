@@ -16,7 +16,7 @@ bun run dev
 bun test
 
 # Type-check
-npx tsc --noEmit
+bun run typecheck
 
 # Deploy to Cloudflare Workers
 bun run deploy
@@ -31,12 +31,16 @@ bun run deploy
 | `SUI_MNEMONIC` | BIP-39 mnemonic for the sponsor keypair |
 | `DRY_RUN_ONLY` | When set, `/sponsor` always returns dry-run results |
 | `EXECUTION_TIMEOUT_MS` | Max execution time in ms (default: `30000`) |
+| `GAS_BUDGET_MAX` | Optional. Hard server-side cap on gas budget, as a decimal string in MIST (e.g. `"50000000000"`). Enforced before policy matching on both `/sponsor` and `/sponsor/ws` — independent of any per-policy `gasBudgetMax`, which only soft-skips a policy. |
 
 ### Cloudflare bindings
 
 | Binding | Type | Description |
 |---|---|---|
 | `ANALYTICS` | Analytics Engine | Optional. When bound, writes sponsorship analytics per request. |
+| `SENDER_RATE_LIMIT` | Rate Limiting | Optional. When bound, caps requests per sender address. Absent = no per-sender limit. |
+| `IP_RATE_LIMIT` | Rate Limiting | Optional. When bound, caps requests per `cf-connecting-ip`. Absent = no per-IP limit. |
+| `DYNAMIC_SENDERS_CACHE` | KV Namespace | Optional. Caches allow decisions from `senders.dynamic` checks that set `cacheTtlSeconds > 0`. Absent = dynamic sender checks are never cached. |
 
 To enable analytics, add the binding in `wrangler.jsonc`:
 
@@ -45,6 +49,34 @@ To enable analytics, add the binding in `wrangler.jsonc`:
   { "binding": "ANALYTICS", "dataset": "sponsorship" }
 ]
 ```
+
+To enable rate limiting, add the bindings under `unsafe.bindings` in `wrangler.jsonc`
+(the `period` must be `10` or `60` seconds):
+
+```jsonc
+"unsafe": {
+  "bindings": [
+    {
+      "name": "SENDER_RATE_LIMIT",
+      "type": "ratelimit",
+      "namespace_id": "1001",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "IP_RATE_LIMIT",
+      "type": "ratelimit",
+      "namespace_id": "1002",
+      "simple": { "limit": 30, "period": 60 }
+    }
+  ]
+}
+```
+
+Both bindings are checked, in order (sender then IP), before policy matching,
+simulation, and signing. Either binding may be omitted independently — an
+unbound limiter simply isn't enforced. A request that exceeds either limit is
+rejected with `429` over HTTP, or a WebSocket close code `1008` with a
+rate-limit error message.
 
 ## Deployment
 
@@ -83,7 +115,9 @@ Deploy with the `--config` flag:
 bun run deploy --config ~/my-onara-config
 ```
 
-The deploy script reads all `*.json` files from `<config>/policies/`, generates the policy registry, deploys using your `wrangler.jsonc`, and restores the in-tree files afterward.
+The deploy script reads all `*.json` files from `<config>/policies/`, validates
+the complete policy set before invoking Wrangler, generates the policy registry,
+deploys using your `wrangler.jsonc`, and restores the in-tree files afterward.
 
 ### Updating
 
@@ -177,20 +211,53 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 }
 ```
 
+**Error response (429, rate limited):**
+
+```json
+{
+  "error": "Rate limit exceeded for sender 0x...."
+}
+```
+
 ## Policy engine
 
 Policies are JSON files in the `policies/` directory, registered in `policies/index.ts`. The server loads and compiles them at startup.
 
-When a transaction arrives at `/sponsor`, the engine:
+When a transaction arrives at `/sponsor` (or `/sponsor/ws`), the engine:
 
-1. Verifies the embedded sender and gas owner match the request
-2. Evaluates all **deny** policies first — if any match, the transaction is rejected immediately
-3. Evaluates **allow** policies in order, soft-skipping any that don't apply (disabled, sender restriction, gas budget)
-4. Validates the transaction against the first applicable allow policy
-5. Returns the matched policy name and called targets on success, or collects the error and tries the next policy
-6. If no allow policy matches, the transaction is rejected (deny by default)
+1. Rejects requests over the `GAS_BUDGET_MAX` server cap (if configured) and requests that exceed the `SENDER_RATE_LIMIT` / `IP_RATE_LIMIT` bindings (if bound) — before any policy matching, simulation, or signing
+2. Verifies the embedded sender and gas owner match the request
+3. Rejects sponsor-scoped balance withdrawals and any command that references `GasCoin`
+4. Evaluates all **deny** policies first — if any match, the transaction is rejected immediately
+5. Evaluates **allow** policies in order, soft-skipping any that don't apply (disabled, sender restriction, gas budget)
+6. Validates the transaction against the first applicable allow policy
+7. Returns the matched policy name and called targets on success, or collects the error and tries the next policy
+8. If no allow policy matches, the transaction is rejected (deny by default)
+9. After a policy matches, resolves every owned-object input over RPC and requires it to be sender-owned or immutable (before simulation and signing)
 
 Deny policies are always evaluated before allow policies, regardless of their position in the config array. This prevents accidental misconfiguration where an allow-all rule overrides a deny rule.
+
+### Sponsor-only-gas invariants
+
+The policy schema is not the only authorization boundary. Onara enforces
+these invariants for every policy, independent of what a matched policy
+allows:
+
+- the transaction sender is present and matches the request sender;
+- the gas owner is present and matches the configured sponsor;
+- `FundsWithdrawal` inputs may withdraw from the sender only;
+- commands may not reference `GasCoin`; and
+- every `ImmOrOwnedObject` command input must be sender-owned or immutable.
+
+The last check — the owned-input RPC lookup — is defense-in-depth, not a fix
+for a known chain-level hole: Sui's transaction checks already verify a
+non-gas `ImmOrOwnedObject` input against the transaction *sender*, not the
+gas owner, so a sponsor signature alone does not authorize spending someone
+else's owned objects. Onara re-verifies this ownership itself and fails
+closed — a missing object, RPC error, sponsor-owned object, parent-owned
+object, shared owner in an owned-input slot, or unknown owner is rejected
+before simulation and signing. Explicit gas-payment references remain
+separate from command inputs and may be sponsor-owned.
 
 ### Policy actions
 
@@ -208,7 +275,7 @@ Deny policies only support `targets` and `senders`. Allow-only fields (suinsName
 Each allow policy operates in exactly one of two modes:
 
 - **Constraint mode** (`targets`) — an unordered allowlist of Move call targets with optional call limits and ordering rules
-- **Sequence mode** (`sequence`) — an ordered list of steps that the transaction's commands must follow in order
+- **Sequence mode** (`sequence`) — an ordered list of steps that the transaction's Move calls must follow in order
 
 ### Policy schema
 
@@ -220,7 +287,15 @@ Each allow policy operates in exactly one of two modes:
 
   // Soft-skip controls (policy is silently skipped if these don't match)
   "enabled": true,                     // default: true
-  "senders": ["0x<address>", ...],     // optional — restrict to specific senders
+  "senders": {                         // optional — see "Sender whitelists" below
+    "static": ["0x<address>", ...],    // optional — a fixed address list
+    "dynamic": {                       // optional — an HTTP-backed whitelist (allow only)
+      "url": "https://...",
+      "timeoutMs": 1500,
+      "cacheTtlSeconds": 0,
+      "secretEnv": "DYNAMIC_SENDERS_SECRET"
+    }
+  },
   "suinsNames": ["onara.sui", "*.onara.sui"], // optional — restrict to SuiNS name holders (allow only)
   "gasBudgetMax": 50000000,            // optional — skip if tx gas budget exceeds this (allow only)
 
@@ -277,6 +352,8 @@ Targets use the `package::module::function` format. Three wildcard forms are sup
 | `0xPKG::*` | Any module and function in the package |
 
 Package addresses are normalized to full 64-character hex (with `0x` prefix), so `0x2` and `0x0000...0002` are equivalent.
+Configured and transaction type arguments are normalized the same way before
+comparison.
 
 ### Call limits
 
@@ -294,7 +371,7 @@ In sequence mode, each step specifies:
 - `count` — exact number of matching calls required
 - `min` / `max` — range of matching calls (mutually exclusive with `count`; defaults to exactly 1 if none specified)
 
-Commands are consumed greedily in order. If a command doesn't match the current step, the engine advances to the next step. After all steps are processed, any remaining commands cause rejection.
+Move calls are consumed greedily in order. If a call doesn't match the current step, the engine advances to the next step. After all steps are processed, any remaining Move calls cause rejection. Use `allowedCommandKinds` and `maxCommands` to bound non-Move commands as well.
 
 ### Result flow
 
@@ -304,12 +381,125 @@ Commands are consumed greedily in order. If a command doesn't match the current 
 - `to` — allowed consuming targets (which targets may receive the result as an argument)
 - `required` — if `true` (default), the result *must* be consumed; unconsumed results are rejected
 
+Today, result flow tracks Move-call consumers, not `TransferObjects`,
+`SplitCoins`, `MergeCoins`, or `MakeMoveVec`, and it does not distinguish tuple
+result positions. Policies that require an exact all-command dataflow graph
+should not rely on `resultFlow` alone.
+
+### Sender whitelists
+
+`senders` restricts which addresses a policy applies to. It's an object with
+a `static` list, a `dynamic` HTTP-backed check, or both — at least one is
+required:
+
+```jsonc
+// Static only — a fixed address list
+"senders": { "static": ["0xALICE", "0xBOB"] }
+
+// Dynamic only — every sender is checked against an external endpoint
+"senders": {
+  "dynamic": { "url": "https://issuer.example.com/onara/authorize" }
+}
+
+// Combined — static addresses skip the HTTP call; everyone else is checked
+"senders": {
+  "static": ["0xALICE"],
+  "dynamic": { "url": "https://issuer.example.com/onara/authorize" }
+}
+```
+
+**Static.** `senders.static` is a fixed address list, checked synchronously
+against the transaction sender — no RPC, no latency. On a **deny** policy,
+`senders` may only use `static` (see below).
+
+**Ordering.** A policy with `dynamic` applies to *every* sender, so it never
+soft-skips on a static miss. Because matching is first-match-wins, place
+dynamic policies **after** narrower static ones: a sender listed only in a
+later static policy would otherwise be routed to the authorizer and a `403`
+there is final.
+
+**Dynamic.** `senders.dynamic` (allow policies only) points at an HTTP
+endpoint that decides, per request, whether the sender may be sponsored
+under that policy:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `url` | `string` | — | Endpoint to call. Must be `https://`, except `http://localhost` / `http://127.0.0.1` for local development. |
+| `timeoutMs` | `number` | `1500` | Request timeout in milliseconds. |
+| `cacheTtlSeconds` | `number` | `0` | If `> 0`, cache an **allow** decision for this sender+policy in `DYNAMIC_SENDERS_CACHE` for this many seconds (must be `0` or `>= 60` — Cloudflare KV's minimum TTL). `0` disables caching. |
+| `secretEnv` | `string` | `"DYNAMIC_SENDERS_SECRET"` | Name of the env var / secret holding the HMAC signing key for this endpoint. |
+
+Onara sends a signed `GET` request:
+
+```
+GET <url>
+X-Onara-Sender: <normalized sender address>
+X-Onara-Policy: <policy name>
+X-Onara-Network: <SUI_NETWORK>
+X-Onara-Timestamp: <unix seconds>
+X-Onara-Signature: hex(HMAC-SHA256(secret, "<sender>\n<policy>\n<network>\n<timestamp>"))
+User-Agent: onara
+```
+
+The sender is always the address parsed and verified from the transaction
+bytes, normalized to lowercase `0x` + 64 hex digits — **not** the raw
+request field — so your app-side store must normalize addresses the same
+way before comparing.
+
+**Response contract:**
+
+| Status | Meaning |
+|---|---|
+| `204` | Allow. Cached if `cacheTtlSeconds > 0`. |
+| `403` | Deny. Client sees `403` with `Sender not in dynamic whitelist for policy "<name>"`. Never cached. |
+| Anything else, timeout, or network error | Onara fails **closed** — client sees `503` with `Dynamic sender check unavailable`. Never cached. |
+
+**When `static` and `dynamic` are both set:** the policy still applies to
+every sender (a dynamic-configured policy is never soft-skipped by
+`static`). After the policy otherwise matches, a sender in `static` is
+allowed with **no HTTP call**; everyone else goes through the dynamic
+check. This lets you whitelist trusted addresses for free while gating the
+long tail behind your own logic.
+
+A minimal Hono authorizer endpoint, using the same signing scheme and a KV
+lookup:
+
+```ts
+app.get('/onara/authorize', async (c) => {
+  const sender = c.req.header('X-Onara-Sender')!
+  const policy = c.req.header('X-Onara-Policy')!
+  const network = c.req.header('X-Onara-Network')!
+  const timestamp = Number(c.req.header('X-Onara-Timestamp'))
+  const signature = c.req.header('X-Onara-Signature')!
+
+  // verifyDynamicSenderSignature is exported from onara's src/dynamic-senders.ts;
+  // copy it or reimplement the same HMAC scheme in your app.
+  const ok = await verifyDynamicSenderSignature({
+    secret: c.env.DYNAMIC_SENDERS_SECRET,
+    sender,
+    policyName: policy,
+    network,
+    timestamp,
+    signature,
+  })
+  if (!ok) return c.body(null, 403)
+
+  const allowed = await c.env.WHITELIST_KV.get(`${policy}:${sender}`)
+  return c.body(null, allowed ? 204 : 403)
+})
+```
+
+Set the secret with `wrangler secret put DYNAMIC_SENDERS_SECRET` (or
+whatever `secretEnv` names), and bind a KV namespace as
+`DYNAMIC_SENDERS_CACHE` if any policy sets `cacheTtlSeconds > 0` — see
+`wrangler.example.jsonc`.
+
 ### Soft skip vs. hard rejection
 
 These conditions cause a policy to be **silently skipped** (the engine moves to the next policy):
 
 - `enabled: false`
-- `senders` list doesn't include the transaction sender
+- `senders.static` is set (and `senders.dynamic` is not) and doesn't include the transaction sender — a policy with `senders.dynamic` is never skipped this way; the allow/deny decision happens after matching, per sender (see "Sender whitelists")
 - `suinsNames` doesn't match the sender's SuiNS name (or sender has no name)
 - `gasBudgetMax` is exceeded by the transaction's gas budget
 
@@ -401,7 +591,7 @@ Block a spammer, allow everyone else:
   {
     "name": "block-spammer",
     "action": "deny",
-    "senders": ["0xSPAMMER_ADDRESS"]
+    "senders": { "static": ["0xSPAMMER_ADDRESS"] }
   },
   {
     "name": "allow-all",
@@ -434,10 +624,9 @@ Only allow two specific addresses to interact with a DeFi module, capping gas at
 ```json
 {
   "name": "defi-vip",
-  "senders": [
-    "0xALICE_ADDRESS",
-    "0xBOB_ADDRESS"
-  ],
+  "senders": {
+    "static": ["0xALICE_ADDRESS", "0xBOB_ADDRESS"]
+  },
   "gasBudgetMax": 50000000000,
   "targets": [
     "0xDEFI_PKG::pool::swap",
@@ -622,6 +811,8 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 
 - Policy schema validation (invalid configs are rejected at load time)
 - Security checks (sender/sponsor mismatch detection)
+- Sponsor-only-gas checks (`GasCoin` — including via `MoveCall`, `SplitCoins`, `MergeCoins`, and `MakeMoveVec` — sender-scoped withdrawals, owned-input authorization)
+- Server-level gas budget cap and per-sender/per-IP rate limit helpers (`src/request-guards.test.ts`)
 - Constraint mode (target matching, call limits, countMatch, ordering)
 - Wildcards (universal, module, and package level)
 - Sequence mode (step matching, count enforcement, extra command rejection)
@@ -630,15 +821,22 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 - Deny policies (target deny, sender deny, any-match semantics, order independence)
 - SuiNS name matching (wildcard, exact, DNS RFC 4592, case insensitivity, soft-skip)
 - Soft skip behavior (disabled, sender restriction, SuiNS name, gas budget fallthrough)
+- Dynamic sender whitelist — request signing, response mapping, caching, static+dynamic combination (`src/dynamic-senders.test.ts`)
 - Integration test against the real `policies/default.json`
 
 ## Project structure
 
 ```
 src/
-  app.ts          Hono HTTP server — /status, /policies, /sponsor
+  app.ts          Hono HTTP server — /status, /policies, /sponsor, /sponsor/ws
   policy.ts       Policy engine — schema, compiler, validator
   policy.test.ts  Offline test suite (bun:test)
+  input-authorization.ts       Sender-owned input authorization
+  input-authorization.test.ts  Owned-input authorization tests
+  request-guards.ts            Gas budget cap + rate limit helpers (HTTP + WS)
+  request-guards.test.ts       Request guard tests
+  dynamic-senders.ts           Dynamic sender whitelist HTTP check (HMAC signing, caching)
+  dynamic-senders.test.ts      Dynamic sender whitelist tests
   workers.ts      Cloudflare Workers entrypoint
 policies/
   index.ts        Policy registry

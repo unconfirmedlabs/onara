@@ -5,10 +5,12 @@
     "dev": "wrangler dev",
     "deploy": "bun scripts/deploy.ts",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@mysten/sui": "^2.5.0",
+    "@protobuf-ts/grpcweb-transport": "^2.11.1",
     "envalid": "^8.1.1",
     "hono": "^4.12.3",
     "p-retry": "^7.1.1",
@@ -17,6 +19,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.3.9",
+    "typescript": "^5.9.3",
     "wrangler": "^4.69.0"
   }
 }

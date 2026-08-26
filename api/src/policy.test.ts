@@ -124,11 +124,233 @@ describe('loadPolicies', () => {
       ]),
     ).toThrow(/circular/)
   })
+
+  test('rejects bare array senders (object form required)', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'bad',
+          targets: [`${PKG}::mod::fn`],
+          senders: [SENDER],
+        },
+      ]),
+    ).toThrow()
+  })
+
+  test('rejects senders object with neither static nor dynamic', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'bad',
+          targets: [`${PKG}::mod::fn`],
+          senders: {},
+        },
+      ]),
+    ).toThrow(/at least one of static or dynamic/)
+  })
+
+  test('rejects an empty senders.static list', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'bad',
+          targets: [`${PKG}::mod::fn`],
+          senders: { static: [] },
+        },
+      ]),
+    ).toThrow()
+  })
+
+  test('rejects cacheTtlSeconds between 1 and 59', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'bad',
+          targets: [`${PKG}::mod::fn`],
+          senders: { dynamic: { url: 'https://example.com/authorize', cacheTtlSeconds: 30 } },
+        },
+      ]),
+    ).toThrow(/cacheTtlSeconds/)
+  })
+
+  test('accepts senders.static only', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'ok',
+          targets: [`${PKG}::mod::fn`],
+          senders: { static: [SENDER] },
+        },
+      ]),
+    ).not.toThrow()
+  })
+
+  test('applies dynamicSenders defaults', () => {
+    const policies = loadPolicies([
+      {
+        name: 'ok',
+        targets: [`${PKG}::mod::fn`],
+        senders: { dynamic: { url: 'https://example.com/authorize' } },
+      },
+    ])
+    const compiled = policies.allow[0]!.senders!.dynamic!
+    expect(compiled.timeoutMs).toBe(1500)
+    expect(compiled.cacheTtlSeconds).toBe(0)
+    expect(compiled.secretEnv).toBe('DYNAMIC_SENDERS_SECRET')
+  })
+
+  test('rejects dynamicSenders on a deny policy', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'bad-deny',
+          action: 'deny',
+          senders: { dynamic: { url: 'https://example.com/authorize' } },
+        },
+      ]),
+    ).toThrow(/Deny policies only support targets and senders/)
+  })
+
+  test('accepts a static-only senders list on a deny policy', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'ok-deny',
+          action: 'deny',
+          senders: { static: [SENDER] },
+        },
+      ]),
+    ).not.toThrow()
+  })
+
+  test('rejects http:// dynamicSenders url for a non-localhost host', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'bad',
+          targets: [`${PKG}::mod::fn`],
+          senders: { dynamic: { url: 'http://example.com/authorize' } },
+        },
+      ]),
+    ).toThrow(/must be https/)
+  })
+
+  test('accepts http:// dynamicSenders url for localhost', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'ok',
+          targets: [`${PKG}::mod::fn`],
+          senders: { dynamic: { url: 'http://localhost:8787/authorize' } },
+        },
+      ]),
+    ).not.toThrow()
+  })
+
+  test('accepts http:// dynamicSenders url for 127.0.0.1', () => {
+    expect(() =>
+      loadPolicies([
+        {
+          name: 'ok',
+          targets: [`${PKG}::mod::fn`],
+          senders: { dynamic: { url: 'http://127.0.0.1:8787/authorize' } },
+        },
+      ]),
+    ).not.toThrow()
+  })
 })
 
 // ─── Security checks ─────────────────────────────────────────────────────────
 
 describe('security checks', () => {
+  test('rejects GasCoin use even when the command kind is allowed', async () => {
+    const policies = loadPolicies([
+      {
+        name: 'p',
+        targets: [`${PKG}::mod::fn`],
+        allowedCommandKinds: ['MoveCall', 'TransferObjects'],
+      },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+      tx.transferObjects([tx.gas], SENDER)
+    })
+
+    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+  })
+
+  test('rejects GasCoin passed as a MoveCall argument (pay::split_and_transfer gas-drain)', async () => {
+    const attacker = '0x0000000000000000000000000000000000000000000000000000000000000666'
+    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({
+        target: `${SUI_PKG}::pay::split_and_transfer`,
+        typeArguments: [`${SUI_PKG}::sui::SUI`],
+        arguments: [tx.gas, tx.pure.u64(1_000_000), tx.pure.address(attacker)],
+      })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+  })
+
+  test('rejects GasCoin as a SplitCoins source', async () => {
+    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.splitCoins(tx.gas, [tx.pure.u64(1_000_000)])
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+  })
+
+  test('rejects GasCoin as a MergeCoins destination', async () => {
+    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.mergeCoins(tx.gas, [
+        tx.objectRef({ objectId: '0x42', version: '1', digest: ZERO_DIGEST }),
+      ])
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+  })
+
+  test('rejects GasCoin as a MergeCoins source', async () => {
+    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.mergeCoins(
+        tx.objectRef({ objectId: '0x42', version: '1', digest: ZERO_DIGEST }),
+        [tx.gas],
+      )
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+  })
+
+  test('rejects GasCoin as a MakeMoveVec element', async () => {
+    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.makeMoveVec({ elements: [tx.gas] })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+  })
+
+  test('returns owned object ids for an RPC ownership check', async () => {
+    const policies = loadPolicies([
+      { name: 'p', targets: [`${PKG}::mod::fn`] },
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({
+        target: `${PKG}::mod::fn`,
+        arguments: [
+          tx.objectRef({
+            objectId: '0x42',
+            version: '1',
+            digest: ZERO_DIGEST,
+          }),
+        ],
+      })
+    })
+
+    expect(validate(txBytes, policies).ownedInputIds).toEqual([
+      '0x0000000000000000000000000000000000000000000000000000000000000042',
+    ])
+  })
+
   test('rejects tx where embedded sender ≠ expected sender', async () => {
     const policies = loadPolicies([
       { name: 'p', targets: [`${PKG}::mod::fn`] },
@@ -200,8 +422,8 @@ describe('constraint mode', () => {
       { name: 'p', targets: [`${PKG}::mod::fn`] },
     ])
     const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-      tx.transferObjects([tx.gas], SENDER)
+      const result = tx.moveCall({ target: `${PKG}::mod::fn` })
+      tx.transferObjects([result], SENDER)
     })
     expect(() => validate(txBytes, policies)).toThrow(/command kind not allowed/)
   })
@@ -499,7 +721,7 @@ describe('soft skips', () => {
   test('skips policy with sender restriction, falls through', async () => {
     const otherSender = '0x0000000000000000000000000000000000000000000000000000000000000099'
     const policies = loadPolicies([
-      { name: 'restricted', targets: [`${PKG}::mod::fn`], senders: [otherSender] },
+      { name: 'restricted', targets: [`${PKG}::mod::fn`], senders: { static: [otherSender] } },
       { name: 'open', targets: [`${PKG}::mod::fn`] },
     ])
     const txBytes = await buildTxBytes((tx) =>
@@ -518,6 +740,87 @@ describe('soft skips', () => {
       { gasBudget: 10_000_000 },
     )
     expect(validate(txBytes, policies).matchedPolicyName).toBe('generous')
+  })
+})
+
+// ─── Dynamic sender whitelist ─────────────────────────────────────────────────
+
+describe('dynamic senders', () => {
+  test('a sender in the static list needs no dynamic check (static hit skips fetch)', async () => {
+    const policies = loadPolicies([
+      {
+        name: 'combined',
+        targets: [`${PKG}::mod::fn`],
+        senders: {
+          static: [SENDER],
+          dynamic: { url: 'https://example.com/authorize' },
+        },
+      },
+    ])
+    const txBytes = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::mod::fn` }),
+    )
+    const result = validate(txBytes, policies)
+    expect(result.matchedPolicyName).toBe('combined')
+    // No dynamic check needed — the caller must not make an HTTP call.
+    expect(result.dynamicSenders).toBeNull()
+  })
+
+  test('a sender not in the static list needs a dynamic check (static miss calls dynamic)', async () => {
+    const otherSender =
+      '0x0000000000000000000000000000000000000000000000000000000000000099'
+    const policies = loadPolicies([
+      {
+        name: 'combined',
+        targets: [`${PKG}::mod::fn`],
+        senders: {
+          static: [otherSender],
+          dynamic: { url: 'https://example.com/authorize' },
+        },
+      },
+    ])
+    const txBytes = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::mod::fn` }),
+    )
+    const result = validate(txBytes, policies)
+    expect(result.matchedPolicyName).toBe('combined')
+    expect(result.dynamicSenders).not.toBeNull()
+    expect(result.dynamicSenders?.url).toBe('https://example.com/authorize')
+  })
+
+  test('dynamic-only senders (no static list) always requires the dynamic check', async () => {
+    const policies = loadPolicies([
+      {
+        name: 'dynamic-only',
+        targets: [`${PKG}::mod::fn`],
+        senders: { dynamic: { url: 'https://example.com/authorize' } },
+      },
+    ])
+    const txBytes = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::mod::fn` }),
+    )
+    const result = validate(txBytes, policies)
+    expect(result.matchedPolicyName).toBe('dynamic-only')
+    expect(result.dynamicSenders).not.toBeNull()
+  })
+
+  test('a policy with only dynamic senders is not soft-skipped for any sender', async () => {
+    const otherSender =
+      '0x0000000000000000000000000000000000000000000000000000000000000099'
+    const policies = loadPolicies([
+      {
+        name: 'dynamic-only',
+        targets: [`${PKG}::mod::fn`],
+        senders: { dynamic: { url: 'https://example.com/authorize' } },
+      },
+    ])
+    const txBytes = await buildTxBytes(
+      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
+      { sender: otherSender },
+    )
+    const result = validate(txBytes, policies, { sender: otherSender })
+    expect(result.matchedPolicyName).toBe('dynamic-only')
+    expect(result.dynamicSenders).not.toBeNull()
   })
 })
 
@@ -591,7 +894,7 @@ describe('deny policies', () => {
 
   test('deny by sender blocks matching sender', async () => {
     const policies = loadPolicies([
-      { name: 'block-sender', action: 'deny', senders: [SENDER] },
+      { name: 'block-sender', action: 'deny', senders: { static: [SENDER] } },
       { name: 'allow-all', targets: ['*'] },
     ])
     const txBytes = await buildTxBytes((tx) => {
@@ -603,7 +906,7 @@ describe('deny policies', () => {
   test('deny by sender does not affect other senders', async () => {
     const otherSender = '0x0000000000000000000000000000000000000000000000000000000000000099'
     const policies = loadPolicies([
-      { name: 'block-sender', action: 'deny', senders: [SENDER] },
+      { name: 'block-sender', action: 'deny', senders: { static: [SENDER] } },
       { name: 'allow-all', targets: ['*'] },
     ])
     const txBytes = await buildTxBytes(

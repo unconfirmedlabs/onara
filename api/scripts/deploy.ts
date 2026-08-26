@@ -2,6 +2,7 @@ import { readdir, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
+import { loadPolicies } from '../src/policy'
 
 const API_DIR = resolve(import.meta.dir, '..')
 const POLICIES_INDEX = join(API_DIR, 'policies', 'index.ts')
@@ -96,6 +97,8 @@ async function main() {
 
   // Read and generate policies
   const policies = await readPolicies(configDir)
+  loadPolicies(policies)
+  console.log('Validated policy schema and constraints')
   const generatedIndex = generateIndex(policies)
 
   // Save original index.ts for restore
