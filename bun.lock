@@ -22,6 +22,18 @@
         "wrangler": "^4.69.0",
       },
     },
+    "sdk": {
+      "name": "@unconfirmed/onara",
+      "version": "0.2.0",
+      "devDependencies": {
+        "@mysten/sui": "^2.5.0",
+        "@types/bun": "^1.3.9",
+        "typescript": "^5.7.0",
+      },
+      "peerDependencies": {
+        "@mysten/sui": "^2.5.0",
+      },
+    },
   },
   "packages": {
     "@0no-co/graphql.web": ["@0no-co/graphql.web@1.2.0", "", { "peerDependencies": { "graphql": "^14.0.0 || ^15.0.0 || ^16.0.0" }, "optionalPeers": ["graphql"] }, "sha512-/1iHy9TTr63gE1YcR5idjx8UREz1s0kFhydf3bBLCXyqjhkIc6igAzTOx3zPifCwFR87tsh/4Pa9cNts6d2otw=="],
@@ -195,6 +207,8 @@
     "@types/bun": ["@types/bun@1.3.9", "", { "dependencies": { "bun-types": "1.3.9" } }, "sha512-KQ571yULOdWJiMH+RIWIOZ7B2RXQGpL1YQrBtLIV3FqDcCu6FsbFUBwhdKUlCKUpS3PJDsHlJ1QKlpxoVR+xtw=="],
 
     "@types/node": ["@types/node@25.3.3", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-DpzbrH7wIcBaJibpKo9nnSQL0MTRdnWttGyE5haGwK86xgMOkFLp7vEyfQPGLOJh5wNYiJ3V9PmUMDhV9u8kkQ=="],
+
+    "@unconfirmed/onara": ["@unconfirmed/onara@workspace:sdk"],
 
     "@unconfirmed/onara-api": ["@unconfirmed/onara-api@workspace:api"],
 

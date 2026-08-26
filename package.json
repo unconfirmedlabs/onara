@@ -1,5 +1,5 @@
 {
   "name": "onara",
   "private": true,
-  "workspaces": ["api"]
+  "workspaces": ["api", "sdk"]
 }
