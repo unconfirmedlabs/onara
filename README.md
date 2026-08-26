@@ -1,16 +1,217 @@
 # Onara
 
-Sui transaction sponsorship: a policy-based gas station server and TypeScript client SDK.
+Policy-enforced gas sponsorship for Sui.
 
-| Package | Description |
+Onara lets an application pay transaction gas without giving up control over
+what it will sponsor. Clients build and sign their own transactions. The Onara
+Worker verifies the sender, gas owner, object ownership, transaction shape, and
+every configured authorization requirement before it adds the sponsor signature
+and submits the transaction to Sui.
+
+- **Declarative policies.** Define reusable requirements, absolute denials, and
+  exact allow branches in one versioned JSON configuration.
+- **Fail-closed authorization.** A transaction must satisfy a complete allow
+  branch, and any matching deny policy wins.
+- **Sender-aware sponsorship.** Dynamic sender requirements call an external
+  authorizer with a domain-separated request signed by a dedicated Sui identity.
+- **Sui SDK integration.** Use the published TypeScript client directly or as a
+  native Sui client extension.
+- **Cloudflare-native operation.** The server runs on Workers with optional KV,
+  Analytics Engine, and rate-limiting bindings.
+
+Documentation: [unconfirmed.com/projects/onara](https://unconfirmed.com/projects/onara)
+
+## Repository
+
+| Path | Purpose |
 |---|---|
-| [api/](./api) | Sponsorship server (Hono on Cloudflare Workers) |
+| [`api/`](./api) | Hono service, schema-v1 policy engine, Cloudflare Worker entry point, deployment tooling, and security tests |
+| [`sdk/`](./sdk) | Source for the published [`@unconfirmed/onara`](https://www.npmjs.com/package/@unconfirmed/onara) TypeScript package |
 
-The TypeScript client SDK is published as [`@unconfirmed/onara`](https://www.npmjs.com/package/@unconfirmed/onara) from the [`unconfirmedlabs/sdks`](https://github.com/unconfirmedlabs/sdks) monorepo.
+Both packages share the root Bun lockfile and are developed in this repository.
+SDK releases are published from `sdk-v*` tags using npm trusted publishing.
 
-## Quick start
+## Use the SDK
 
 ```bash
-bun install            # installs the api workspace
-cd api && bun test     # run API policy tests
+bun add @unconfirmed/onara @mysten/sui
 ```
+
+Register Onara as a Sui client extension:
+
+```ts
+import { onara } from '@unconfirmed/onara'
+import { SuiGrpcClient } from '@mysten/sui/grpc'
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
+import { Transaction } from '@mysten/sui/transactions'
+
+const client = new SuiGrpcClient({
+  network: 'testnet',
+  baseUrl: 'https://fullnode.testnet.sui.io:443',
+}).$extend(onara({ url: 'https://onara.example.com' }))
+
+const signer = new Ed25519Keypair()
+const transaction = new Transaction()
+
+// Add only calls that the deployment's policy allows.
+transaction.moveCall({ target: '0xPACKAGE::module::function' })
+
+const result = await client.onara.sponsorTransaction({
+  transaction,
+  signer,
+})
+```
+
+The extension fetches the sponsor address, sets the transaction sender and gas
+owner, builds with the registered Sui client, collects the sender signature, and
+submits the sponsorship request. The sender's key never leaves the client.
+
+See [`sdk/README.md`](./sdk/README.md) for the standalone client, dry runs,
+policy inspection, transaction status recovery, and the full typed API.
+
+## Policy model
+
+An Onara deployment has one authoritative `config.json`:
+
+```jsonc
+{
+  "version": 1,
+  "wrangler": {
+    "name": "my-onara-testnet",
+    "main": "src/workers.ts",
+    "compatibility_date": "2026-02-26",
+    "vars": {
+      "SUI_NETWORK": "testnet",
+      "SUI_GRPC_URL": "https://fullnode.testnet.sui.io:443"
+    }
+  },
+  "policies": [
+    {
+      "type": "require",
+      "name": "known-user",
+      "check": {
+        "kind": "sender.dynamic",
+        "url": "https://api.example.com/v1/onara/authorize",
+        "audience": "example-onara-authorization",
+        "signingKeyEnv": "ONARA_AUTHORIZER_SIGNING_KEY",
+        "signingIdentity": "0x<canonical-public-sui-address>",
+        "timeoutMs": 1500,
+        "cacheTtlSeconds": 0
+      }
+    },
+    {
+      "type": "deny",
+      "name": "blocked-call",
+      "when": {
+        "kind": "any-move-call",
+        "targets": ["0x2::coin::destroy_zero"]
+      }
+    },
+    {
+      "type": "allow",
+      "name": "create-example",
+      "requires": ["known-user"],
+      "gasBudgetMax": "1000000000",
+      "commands": { "allowed": ["MoveCall"], "max": 1 },
+      "calls": {
+        "mode": "sequence",
+        "rules": [
+          {
+            "id": "create",
+            "targets": ["0xPACKAGE::module::function"],
+            "count": { "min": 1, "max": 1 }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+The policy algebra is:
+
+```text
+deny override; OR(allows); AND(requirements)
+```
+
+- `require` defines a reusable external authorization check. Schema v1 supports
+  `sender.dynamic`.
+- `deny` rejects an absolute or structurally matched transaction before allows
+  are considered.
+- `allow` defines one complete transaction-shape branch. Its `requires` field is
+  mandatory; an empty array is an intentionally public branch.
+
+Policies can constrain command kinds and counts, Move call targets, type
+arguments, ordering, and the exact flow of command results into later call
+arguments. Unknown fields, ambiguous rules, duplicate names, and incomplete
+branches are rejected when configuration loads.
+
+## Security boundary
+
+Policy matching is only one layer. Before Onara simulates or signs, it also
+requires that:
+
+1. the embedded transaction sender equals the requesting sender;
+2. the gas owner equals the configured sponsor;
+3. balance withdrawals belong to the sender, never the sponsor;
+4. commands do not reference `GasCoin`; and
+5. every owned object input is sender-owned or immutable.
+
+Dynamic authorizer requests use a separate Sui signing key selected by
+`signingKeyEnv`. Its public address is pinned in `signingIdentity`; private keys
+must be provisioned as Worker secrets and never placed in `config.json`. Use a
+dedicated authorization key rather than reusing the gas sponsor key.
+
+See [`api/README.md`](./api/README.md) for the complete schema, request signing
+format, endpoint contract, rate limits, bindings, and operational details.
+
+## Run locally
+
+Requirements: [Bun](https://bun.sh), a Sui RPC endpoint, and Wrangler for local
+Worker development.
+
+```bash
+bun install --frozen-lockfile
+
+bun run --cwd api typecheck
+bun run --cwd api test
+
+bun run --cwd sdk build
+bun run --cwd sdk test
+```
+
+Start the Worker locally:
+
+```bash
+bun run --cwd api dev
+```
+
+## Deploy
+
+Keep environment-specific configuration outside the engine repository, then
+pass its directory to the deployment script:
+
+```bash
+cd api
+wrangler secret put SUI_MNEMONIC
+wrangler secret put ONARA_AUTHORIZER_SIGNING_KEY
+bun run deploy --config /path/to/environment
+```
+
+The deploy command validates the unified configuration and complete policy set
+before generating temporary Wrangler artifacts. It also derives locally
+available signing-key identities and checks them against the public identities
+pinned in policy.
+
+## HTTP surface
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /status` | Network, chain ID, sponsor address, and sponsor balances |
+| `GET /policies` | Active schema-v1 policy configuration |
+| `POST /sponsor` | Validate, optionally simulate, sponsor, and execute a signed transaction |
+| `GET /sponsor/:digest/status` | Recover transaction status after an uncertain confirmation |
+
+## License
+
+[Apache-2.0](./LICENSE)
