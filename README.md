@@ -5,12 +5,12 @@ Sui transaction sponsorship: a policy-based gas station server and TypeScript cl
 | Package | Description |
 |---|---|
 | [api/](./api) | Sponsorship server (Hono on Cloudflare Workers) |
-| [sdk/](./sdk) | Client SDK (`onara` on npm) |
+
+The TypeScript client SDK is published as [`@unconfirmed/onara`](https://www.npmjs.com/package/@unconfirmed/onara) from the [`unconfirmedlabs/sdks`](https://github.com/unconfirmedlabs/sdks) monorepo.
 
 ## Quick start
 
 ```bash
-bun install            # installs both workspaces
+bun install            # installs the api workspace
 cd api && bun test     # run API policy tests
-cd sdk && bun test     # run SDK tests
 ```
