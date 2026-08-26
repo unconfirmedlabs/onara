@@ -1,4 +1,17 @@
 {
+  "type": "allow",
   "name": "allow-all",
-  "targets": ["*"]
+  "requires": [],
+  "commands": {
+    "allowed": ["MoveCall"]
+  },
+  "calls": {
+    "mode": "set",
+    "rules": [
+      {
+        "id": "all-move-calls",
+        "targets": ["*"]
+      }
+    ]
+  }
 }

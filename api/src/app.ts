@@ -10,7 +10,13 @@ import { GrpcWebFetchTransport } from '@protobuf-ts/grpcweb-transport'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
 import { fromBase64, isValidSuiAddress, normalizeSuiAddress } from '@mysten/sui/utils'
 import pRetry from 'p-retry'
-import { loadPolicies, validateSponsoredTxPayload } from './policy'
+import {
+  evaluatePolicyRequirements,
+  loadPolicies,
+  validateSponsoredTxPayload,
+  type AuthorizationDecision,
+  type PolicyEvaluationPlan,
+} from './policy'
 import {
   assertSenderControlsOwnedInputs,
   OwnedInputAuthorizationError,
@@ -18,7 +24,6 @@ import {
 import {
   checkDynamicSender,
   DynamicSenderDeniedError,
-  DynamicSenderUnavailableError,
   type DynamicSendersCache,
 } from './dynamic-senders'
 import { executeTransaction, type OnStatus, type SponsorEvent } from './execution'
@@ -192,6 +197,57 @@ async function guardRequest({
   })
 }
 
+// Shared by HTTP and WebSocket sponsorship. Every external check is signed for
+// one exact (named requirement, concrete allow policy) tuple. Requirements are
+// ANDed within a branch; all structurally matching allow branches are ORed.
+async function evaluateAuthorizationPlan({
+  bindings,
+  plan,
+  txBytesBase64,
+}: {
+  bindings: Bindings
+  plan: PolicyEvaluationPlan
+  txBytesBase64: string
+}): Promise<AuthorizationDecision> {
+  const txData = Transaction.from(txBytesBase64).getData()
+  const sender = normalizeSuiAddress(txData.sender!)
+
+  return evaluatePolicyRequirements({
+    allowBranches: plan.allowBranches,
+    evaluate: async ({ requirement, policyName }) => {
+      try {
+        await checkDynamicSender({
+          check: requirement.check,
+          requirementName: requirement.name,
+          policyName,
+          sender,
+          network: bindings.SUI_NETWORK,
+          env: bindings as Record<string, unknown>,
+          cache: bindings.DYNAMIC_SENDERS_CACHE,
+        })
+        return 'allow'
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Dynamic sender check failed.'
+        console.error(
+          JSON.stringify({
+            message: 'Policy requirement check failed.',
+            sender,
+            requirement: requirement.name,
+            policy: policyName,
+            error: message,
+          }),
+        )
+        return error instanceof DynamicSenderDeniedError
+          ? 'deny'
+          : 'unavailable'
+      }
+    },
+  })
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/status', async (c) => {
@@ -316,19 +372,17 @@ app.post('/sponsor', async (c) => {
   let calledTargets: string[] = []
   let matchedPolicyName = ''
   let ownedInputIds: string[] = []
-  let matchedDynamicSenders: ReturnType<typeof validateSponsoredTxPayload>['dynamicSenders'] = null
+  let evaluationPlan: PolicyEvaluationPlan
   try {
-    const validation = validateSponsoredTxPayload({
+    evaluationPlan = validateSponsoredTxPayload({
       txBytesBase64: parsed.data.txBytes,
       expectedSender: parsed.data.sender,
       expectedSponsor: sponsorAddress,
       policies: SPONSORED_POLICIES,
       senderName,
     })
-    calledTargets = validation.calledTargets
-    matchedPolicyName = validation.matchedPolicyName
-    ownedInputIds = validation.ownedInputIds
-    matchedDynamicSenders = validation.dynamicSenders
+    calledTargets = evaluationPlan.calledTargets
+    ownedInputIds = evaluationPlan.ownedInputIds
   } catch (error) {
     const message =
       error instanceof Error
@@ -357,40 +411,20 @@ app.post('/sponsor', async (c) => {
   }
   endTime(c, 'ownership')
 
-  if (matchedDynamicSenders) {
-    startTime(c, 'dynamicSenders', 'Dynamic sender check')
-    try {
-      const txData = Transaction.from(parsed.data.txBytes).getData()
-      await checkDynamicSender({
-        dynamicSenders: matchedDynamicSenders,
-        policyName: matchedPolicyName,
-        sender: normalizeSuiAddress(txData.sender!),
-        network: bindings.SUI_NETWORK,
-        env: bindings as Record<string, unknown>,
-        cache: bindings.DYNAMIC_SENDERS_CACHE,
-      })
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Dynamic sender check failed.'
-      console.error(
-        JSON.stringify({
-          message: 'Dynamic sender check failed.',
-          sender: parsed.data.sender,
-          policy: matchedPolicyName,
-          error: message,
-        }),
-      )
-      if (error instanceof DynamicSenderDeniedError) {
-        return c.json(
-          { error: `Sender not in dynamic whitelist for policy "${matchedPolicyName}"` },
-          403,
-        )
-      }
-      // DynamicSenderUnavailableError, or any unexpected failure — fail closed.
-      return c.json({ error: 'Dynamic sender check unavailable' }, 503)
-    }
-    endTime(c, 'dynamicSenders')
+  startTime(c, 'requirements', 'Policy requirement checks')
+  const authorization = await evaluateAuthorizationPlan({
+    bindings,
+    plan: evaluationPlan,
+    txBytesBase64: parsed.data.txBytes,
+  })
+  endTime(c, 'requirements')
+  if (authorization.status === 'denied') {
+    return c.json({ error: 'Transaction policy requirements denied.' }, 403)
   }
+  if (authorization.status === 'unavailable') {
+    return c.json({ error: 'Transaction policy requirements unavailable.' }, 503)
+  }
+  matchedPolicyName = authorization.policyName
 
   console.log(
     JSON.stringify({
@@ -586,18 +620,16 @@ app.get(
         send({ status: 'validating' })
         let matchedPolicyName = ''
         let ownedInputIds: string[] = []
-        let matchedDynamicSenders: ReturnType<typeof validateSponsoredTxPayload>['dynamicSenders'] = null
+        let evaluationPlan: PolicyEvaluationPlan
         try {
-          const validation = validateSponsoredTxPayload({
+          evaluationPlan = validateSponsoredTxPayload({
             txBytesBase64: parsed.data.txBytes,
             expectedSender: parsed.data.sender,
             expectedSponsor: sponsorAddress,
             policies: SPONSORED_POLICIES,
             senderName,
           })
-          matchedPolicyName = validation.matchedPolicyName
-          ownedInputIds = validation.ownedInputIds
-          matchedDynamicSenders = validation.dynamicSenders
+          ownedInputIds = evaluationPlan.ownedInputIds
         } catch (error) {
           send({ status: 'error', error: error instanceof Error ? error.message : 'Policy validation failed.' })
           ws.close(1008)
@@ -622,42 +654,22 @@ app.get(
           return
         }
 
-        if (matchedDynamicSenders) {
-          try {
-            const txData = Transaction.from(parsed.data.txBytes).getData()
-            await checkDynamicSender({
-              dynamicSenders: matchedDynamicSenders,
-              policyName: matchedPolicyName,
-              sender: normalizeSuiAddress(txData.sender!),
-              network: bindings.SUI_NETWORK,
-              env: bindings as Record<string, unknown>,
-              cache: bindings.DYNAMIC_SENDERS_CACHE,
-            })
-          } catch (error) {
-            const message =
-              error instanceof Error ? error.message : 'Dynamic sender check failed.'
-            console.error(
-              JSON.stringify({
-                message: 'Dynamic sender check failed.',
-                sender: parsed.data.sender,
-                policy: matchedPolicyName,
-                error: message,
-              }),
-            )
-            if (error instanceof DynamicSenderDeniedError) {
-              send({
-                status: 'error',
-                error: `Sender not in dynamic whitelist for policy "${matchedPolicyName}"`,
-              })
-              ws.close(1008)
-              return
-            }
-            // DynamicSenderUnavailableError, or any unexpected failure — fail closed.
-            send({ status: 'error', error: 'Dynamic sender check unavailable' })
-            ws.close(1011)
-            return
-          }
+        const authorization = await evaluateAuthorizationPlan({
+          bindings,
+          plan: evaluationPlan,
+          txBytesBase64: parsed.data.txBytes,
+        })
+        if (authorization.status === 'denied') {
+          send({ status: 'error', error: 'Transaction policy requirements denied.' })
+          ws.close(1008)
+          return
         }
+        if (authorization.status === 'unavailable') {
+          send({ status: 'error', error: 'Transaction policy requirements unavailable.' })
+          ws.close(1011)
+          return
+        }
+        matchedPolicyName = authorization.policyName
 
         const txBytes = fromBase64(parsed.data.txBytes)
 

@@ -1,1064 +1,917 @@
 import { describe, expect, test } from 'bun:test'
-import { Transaction } from '@mysten/sui/transactions'
+import { Transaction, Inputs } from '@mysten/sui/transactions'
 import { toBase64 } from '@mysten/sui/utils'
-import { loadPolicies, validateSponsoredTxPayload, type CompiledPolicies } from './policy'
+import defaultPolicy from '../policies/default.json'
+import {
+  evaluatePolicyRequirements,
+  loadPolicies,
+  validateSponsoredTxPayload,
+  type CompiledPolicies,
+  type PolicyEvaluationPlan,
+} from './policy'
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const SENDER = '0x0000000000000000000000000000000000000000000000000000000000000001'
-const SPONSOR = '0x0000000000000000000000000000000000000000000000000000000000000002'
-const PKG = '0x0000000000000000000000000000000000000000000000000000000000000abc'
-const SUI_PKG = '0x0000000000000000000000000000000000000000000000000000000000000002'
-
-// base58-encoded 32-byte zero digest
+const SENDER =
+  '0x0000000000000000000000000000000000000000000000000000000000000001'
+const SPONSOR =
+  '0x0000000000000000000000000000000000000000000000000000000000000002'
+const PKG =
+  '0x0000000000000000000000000000000000000000000000000000000000000abc'
+const OTHER_PKG =
+  '0x0000000000000000000000000000000000000000000000000000000000000def'
 const ZERO_DIGEST = '11111111111111111111111111111111'
+const IDENTITY =
+  '0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f'
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+function requirement(name = 'sender-ok') {
+  return {
+    type: 'require',
+    name,
+    check: {
+      kind: 'sender.dynamic',
+      url: 'https://example.com/authorize',
+      audience: 'test-authorizer',
+      signingKeyEnv: 'TEST_ONARA_SIGNING_KEY',
+      signingIdentity: IDENTITY,
+    },
+  }
+}
+
+function allow(overrides: Record<string, unknown> = {}) {
+  return {
+    type: 'allow',
+    name: 'allow',
+    requires: [],
+    commands: { allowed: ['MoveCall'] },
+    calls: {
+      mode: 'set',
+      rules: [{ id: 'call', targets: [`${PKG}::mod::fn`] }],
+    },
+    ...overrides,
+  }
+}
 
 async function buildTxBytes(
   setup: (tx: Transaction) => void,
-  opts?: { sender?: string; sponsor?: string; gasBudget?: number },
+  opts: {
+    sender?: string
+    sponsor?: string
+    gasBudget?: number | bigint
+  } = {},
 ): Promise<string> {
-  const sender = opts?.sender ?? SENDER
-  const sponsor = opts?.sponsor ?? SPONSOR
-  const gasBudget = opts?.gasBudget ?? 10_000_000
-
   const tx = new Transaction()
-  tx.setSender(sender)
-  tx.setGasOwner(sponsor)
-  tx.setGasBudget(gasBudget)
-  tx.setGasPrice(1000)
+  tx.setSender(opts.sender ?? SENDER)
+  tx.setGasOwner(opts.sponsor ?? SPONSOR)
+  tx.setGasBudget(opts.gasBudget ?? 10_000_000)
+  tx.setGasPrice(1_000)
   tx.setGasPayment([
     {
-      objectId: '0x0000000000000000000000000000000000000000000000000000000000000000',
+      objectId:
+        '0x0000000000000000000000000000000000000000000000000000000000000000',
       version: '0',
       digest: ZERO_DIGEST,
     },
   ])
-
   setup(tx)
-
-  const bytes = await tx.build()
-  return toBase64(bytes)
+  return toBase64(await tx.build())
 }
 
 function validate(
-  txBytes: string,
+  txBytesBase64: string,
   policies: CompiledPolicies,
-  opts?: { sender?: string; sponsor?: string; senderName?: string | null },
-) {
+  senderName: string | null = null,
+): PolicyEvaluationPlan {
   return validateSponsoredTxPayload({
-    txBytesBase64: txBytes,
-    expectedSender: opts?.sender ?? SENDER,
-    expectedSponsor: opts?.sponsor ?? SPONSOR,
+    txBytesBase64,
+    expectedSender: SENDER,
+    expectedSponsor: SPONSOR,
     policies,
-    senderName: opts?.senderName,
+    senderName,
   })
 }
 
-// ─── loadPolicies — schema validation ─────────────────────────────────────────
+function branchNames(plan: PolicyEvaluationPlan): string[] {
+  return plan.allowBranches.map((branch) => branch.policyName)
+}
 
-describe('loadPolicies', () => {
-  test('rejects config with neither targets nor sequence', () => {
-    expect(() =>
-      loadPolicies([{ name: 'bad', allowedCommandKinds: ['MoveCall'] }]),
-    ).toThrow()
+describe('schema-v1 compilation', () => {
+  test('requires flat typed policies and mandatory allow.requires', () => {
+    expect(() => loadPolicies([{ name: 'legacy', targets: ['*'] }])).toThrow()
+    const missingRequires = allow()
+    delete (missingRequires as Record<string, unknown>).requires
+    expect(() => loadPolicies([missingRequires])).toThrow(/requires/)
+    expect(() => loadPolicies([allow()])).not.toThrow()
   })
 
-  test('rejects config with both targets and sequence', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::fn`],
-          sequence: [{ id: 'step1', targets: [`${PKG}::mod::fn`] }],
+  test('strictly rejects unknown fields at every policy layer', () => {
+    const cases = [
+      { ...allow(), action: 'allow' },
+      allow({ commands: { allowed: ['MoveCall'], extra: true } }),
+      allow({
+        calls: {
+          mode: 'set',
+          rules: [{ id: 'x', targets: ['*'], extra: true }],
         },
-      ]),
-    ).toThrow()
+      }),
+      {
+        ...requirement(),
+        check: { ...requirement().check, secretEnv: 'LEGACY_SECRET' },
+      },
+      { type: 'deny', name: 'd', when: { kind: 'always', targets: ['*'] } },
+    ]
+    for (const candidate of cases) {
+      expect(() => loadPolicies([candidate])).toThrow()
+    }
   })
 
-  test('rejects callLimits in sequence mode', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'bad',
-          sequence: [{ id: 'step1', targets: [`${PKG}::mod::fn`] }],
-          callLimits: { [`${PKG}::mod::fn`]: { min: 1 } },
-        },
-      ]),
-    ).toThrow()
+  test('gasBudgetMax is a positive decimal string and retains bigint precision', () => {
+    expect(() => loadPolicies([allow({ gasBudgetMax: 10 })])).toThrow(
+      /gasBudgetMax/,
+    )
+    for (const value of ['0', '-1', '+1', '01', '1.0', ' 1']) {
+      expect(() => loadPolicies([allow({ gasBudgetMax: value })])).toThrow(
+        /gasBudgetMax/,
+      )
+    }
+    const compiled = loadPolicies([
+      allow({ gasBudgetMax: '900719925474099300000' }),
+    ])
+    expect(compiled.allow[0]!.gasBudgetMax).toBe(900719925474099300000n)
   })
 
-  test('rejects duplicate policy names', () => {
-    expect(() =>
-      loadPolicies([
-        { name: 'dup', targets: [`${PKG}::mod::fn`] },
-        { name: 'dup', targets: [`${PKG}::mod::fn`] },
-      ]),
-    ).toThrow(/Duplicate/)
-  })
-
-  test('rejects callLimits target not in targets', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::fn`],
-          callLimits: { [`${PKG}::mod::other`]: { min: 1 } },
-        },
-      ]),
-    ).toThrow(/not in allowed targets/)
-  })
-
-  test('rejects circular countMatch chain', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::a`, `${PKG}::mod::b`],
-          callLimits: {
-            [`${PKG}::mod::a`]: { countMatch: `${PKG}::mod::b` },
-            [`${PKG}::mod::b`]: { countMatch: `${PKG}::mod::a` },
+  test('rejects duplicate names, values, rules, normalized values, and flow clauses', () => {
+    const duplicateCases = [
+      [allow(), allow()],
+      [allow({ requires: ['x', 'x'] })],
+      [allow({ commands: { allowed: ['MoveCall', 'MoveCall'] } })],
+      [
+        allow({
+          senders: ['0x1', SENDER],
+        }),
+      ],
+      [
+        allow({
+          calls: {
+            mode: 'set',
+            rules: [
+              { id: 'x', targets: [`${PKG}::m::a`] },
+              { id: 'x', targets: [`${PKG}::m::b`] },
+            ],
           },
-        },
+        }),
+      ],
+      [
+        allow({
+          calls: {
+            mode: 'set',
+            rules: [
+              { id: 'x', targets: ['0xabc::m::a', `${PKG}::m::a`] },
+            ],
+          },
+        }),
+      ],
+      [
+        allow({
+          calls: {
+            mode: 'set',
+            rules: [
+              { id: 'a', targets: [`${PKG}::m::a`] },
+              { id: 'b', targets: [`${PKG}::m::b`] },
+            ],
+            resultFlow: [
+              {
+                from: { rule: 'a', result: 0 },
+                to: [{ rule: 'b', argument: 0 }],
+              },
+              {
+                from: { rule: 'a', result: 0 },
+                to: [{ rule: 'b', argument: 1 }],
+              },
+            ],
+          },
+        }),
+      ],
+      [
+        allow({
+          calls: {
+            mode: 'set',
+            rules: [
+              { id: 'a', targets: [`${PKG}::m::a`] },
+              { id: 'b', targets: [`${PKG}::m::b`] },
+            ],
+            resultFlow: [
+              {
+                from: { rule: 'a', result: 0 },
+                to: [
+                  { rule: 'b', argument: 0 },
+                  { rule: 'b', argument: 0 },
+                ],
+              },
+            ],
+          },
+        }),
+      ],
+    ]
+    for (const policies of duplicateCases) {
+      expect(() => loadPolicies(policies)).toThrow()
+    }
+  })
+
+  test('rejects overlapping target ownership across local call rules', () => {
+    expect(() =>
+      loadPolicies([
+        allow({
+          calls: {
+            mode: 'set',
+            rules: [
+              { id: 'module', targets: [`${PKG}::mod::*`] },
+              { id: 'exact', targets: [`${PKG}::mod::fn`] },
+            ],
+          },
+        }),
+      ]),
+    ).toThrow(/overlapping targets/)
+  })
+
+  test('validates local references and cycles', () => {
+    expect(() =>
+      loadPolicies([
+        allow({
+          calls: {
+            mode: 'set',
+            rules: [
+              {
+                id: 'a',
+                targets: [`${PKG}::m::a`],
+                count: { sameAs: 'missing' },
+              },
+            ],
+          },
+        }),
+      ]),
+    ).toThrow(/unknown rule/)
+
+    expect(() =>
+      loadPolicies([
+        allow({
+          calls: {
+            mode: 'set',
+            rules: [
+              {
+                id: 'a',
+                targets: [`${PKG}::m::a`],
+                count: { sameAs: 'b' },
+              },
+              {
+                id: 'b',
+                targets: [`${PKG}::m::b`],
+                count: { sameAs: 'a' },
+              },
+            ],
+          },
+        }),
       ]),
     ).toThrow(/circular/)
-  })
 
-  test('rejects bare array senders (object form required)', () => {
     expect(() =>
       loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::fn`],
-          senders: [SENDER],
-        },
+        allow({
+          calls: {
+            mode: 'sequence',
+            rules: [{ id: 'a', targets: [`${PKG}::m::a`] }],
+            ordering: [{ before: 'a', after: 'a' }],
+          },
+        }),
       ]),
     ).toThrow()
   })
 
-  test('rejects senders object with neither static nor dynamic', () => {
+  test('requires enabled requirement references and rejects orphan requirements', () => {
+    expect(() =>
+      loadPolicies([requirement(), allow({ requires: ['missing'] })]),
+    ).toThrow(/unknown requirement/)
     expect(() =>
       loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::fn`],
-          senders: {},
-        },
+        { ...requirement(), enabled: false },
+        allow({ requires: ['sender-ok'] }),
       ]),
-    ).toThrow(/at least one of static or dynamic/)
-  })
-
-  test('rejects an empty senders.static list', () => {
+    ).toThrow(/disabled requirement/)
+    expect(() => loadPolicies([requirement(), allow()])).toThrow(/not referenced/)
     expect(() =>
-      loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::fn`],
-          senders: { static: [] },
-        },
-      ]),
-    ).toThrow()
-  })
-
-  test('rejects cacheTtlSeconds between 1 and 59', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::fn`],
-          senders: { dynamic: { url: 'https://example.com/authorize', cacheTtlSeconds: 30 } },
-        },
-      ]),
-    ).toThrow(/cacheTtlSeconds/)
-  })
-
-  test('accepts senders.static only', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'ok',
-          targets: [`${PKG}::mod::fn`],
-          senders: { static: [SENDER] },
-        },
-      ]),
+      loadPolicies([requirement(), allow({ requires: ['sender-ok'] })]),
     ).not.toThrow()
   })
 
-  test('applies dynamicSenders defaults', () => {
-    const policies = loadPolicies([
-      {
-        name: 'ok',
-        targets: [`${PKG}::mod::fn`],
-        senders: { dynamic: { url: 'https://example.com/authorize' } },
-      },
+  test('dynamic checks require canonical trust data and fail-closed URL defaults', () => {
+    const compiled = loadPolicies([
+      requirement(),
+      allow({ requires: ['sender-ok'] }),
     ])
-    const compiled = policies.allow[0]!.senders!.dynamic!
-    expect(compiled.timeoutMs).toBe(1500)
-    expect(compiled.cacheTtlSeconds).toBe(0)
-    expect(compiled.secretEnv).toBe('DYNAMIC_SENDERS_SECRET')
-  })
+    expect(compiled.require[0]!.check.timeoutMs).toBe(1500)
+    expect(compiled.require[0]!.check.cacheTtlSeconds).toBe(0)
 
-  test('rejects dynamicSenders on a deny policy', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'bad-deny',
-          action: 'deny',
-          senders: { dynamic: { url: 'https://example.com/authorize' } },
-        },
-      ]),
-    ).toThrow(/Deny policies only support targets and senders/)
-  })
-
-  test('accepts a static-only senders list on a deny policy', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'ok-deny',
-          action: 'deny',
-          senders: { static: [SENDER] },
-        },
-      ]),
-    ).not.toThrow()
-  })
-
-  test('rejects http:// dynamicSenders url for a non-localhost host', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'bad',
-          targets: [`${PKG}::mod::fn`],
-          senders: { dynamic: { url: 'http://example.com/authorize' } },
-        },
-      ]),
-    ).toThrow(/must be https/)
-  })
-
-  test('accepts http:// dynamicSenders url for localhost', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'ok',
-          targets: [`${PKG}::mod::fn`],
-          senders: { dynamic: { url: 'http://localhost:8787/authorize' } },
-        },
-      ]),
-    ).not.toThrow()
-  })
-
-  test('accepts http:// dynamicSenders url for 127.0.0.1', () => {
-    expect(() =>
-      loadPolicies([
-        {
-          name: 'ok',
-          targets: [`${PKG}::mod::fn`],
-          senders: { dynamic: { url: 'http://127.0.0.1:8787/authorize' } },
-        },
-      ]),
-    ).not.toThrow()
+    for (const check of [
+      { ...requirement().check, signingIdentity: '0x1' },
+      { ...requirement().check, audience: 'bad\naudience' },
+      { ...requirement().check, signingKeyEnv: 'bad-name' },
+      { ...requirement().check, url: 'http://example.com/auth' },
+      { ...requirement().check, cacheTtlSeconds: 30 },
+    ]) {
+      expect(() =>
+        loadPolicies([
+          { ...requirement(), check },
+          allow({ requires: ['sender-ok'] }),
+        ]),
+      ).toThrow()
+    }
   })
 })
 
-// ─── Security checks ─────────────────────────────────────────────────────────
-
-describe('security checks', () => {
-  test('rejects GasCoin use even when the command kind is allowed', async () => {
+describe('global transaction invariants and deny override', () => {
+  test('rejects GasCoin recursively regardless of allowed command kind', async () => {
     const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::fn`],
-        allowedCommandKinds: ['MoveCall', 'TransferObjects'],
-      },
+      allow({ commands: { allowed: ['MoveCall', 'TransferObjects'] } }),
     ])
     const txBytes = await buildTxBytes((tx) => {
       tx.moveCall({ target: `${PKG}::mod::fn` })
       tx.transferObjects([tx.gas], SENDER)
     })
-
-    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+    expect(() => validate(txBytes, policies)).toThrow(/may not use GasCoin/)
   })
 
-  test('rejects GasCoin passed as a MoveCall argument (pay::split_and_transfer gas-drain)', async () => {
-    const attacker = '0x0000000000000000000000000000000000000000000000000000000000000666'
-    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({
-        target: `${SUI_PKG}::pay::split_and_transfer`,
-        typeArguments: [`${SUI_PKG}::sui::SUI`],
-        arguments: [tx.gas, tx.pure.u64(1_000_000), tx.pure.address(attacker)],
-      })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
+  test('verifies embedded sender and sponsor', async () => {
+    const policies = loadPolicies([allow()])
+    const wrongSender = await buildTxBytes(
+      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
+      { sender: '0x3' },
+    )
+    expect(() => validate(wrongSender, policies)).toThrow(/sender does not match/)
+
+    const wrongSponsor = await buildTxBytes(
+      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
+      { sponsor: '0x3' },
+    )
+    expect(() => validate(wrongSponsor, policies)).toThrow(/gas owner/)
   })
 
-  test('rejects GasCoin as a SplitCoins source', async () => {
-    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.splitCoins(tx.gas, [tx.pure.u64(1_000_000)])
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
-  })
-
-  test('rejects GasCoin as a MergeCoins destination', async () => {
-    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.mergeCoins(tx.gas, [
-        tx.objectRef({ objectId: '0x42', version: '1', digest: ZERO_DIGEST }),
-      ])
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
-  })
-
-  test('rejects GasCoin as a MergeCoins source', async () => {
-    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.mergeCoins(
-        tx.objectRef({ objectId: '0x42', version: '1', digest: ZERO_DIGEST }),
-        [tx.gas],
-      )
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
-  })
-
-  test('rejects GasCoin as a MakeMoveVec element', async () => {
-    const policies = loadPolicies([{ name: 'p', targets: ['*'] }])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.makeMoveVec({ elements: [tx.gas] })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/GasCoin/)
-  })
-
-  test('returns owned object ids for an RPC ownership check', async () => {
-    const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::fn`] },
-    ])
+  test('returns de-duplicated owned inputs for RPC ownership authorization', async () => {
+    const objectId =
+      '0x0000000000000000000000000000000000000000000000000000000000000042'
+    const policies = loadPolicies([allow()])
     const txBytes = await buildTxBytes((tx) => {
       tx.moveCall({
         target: `${PKG}::mod::fn`,
         arguments: [
-          tx.objectRef({
-            objectId: '0x42',
-            version: '1',
-            digest: ZERO_DIGEST,
-          }),
+          tx.object(
+            Inputs.ObjectRef({ objectId, version: '1', digest: ZERO_DIGEST }),
+          ),
         ],
       })
     })
-
-    expect(validate(txBytes, policies).ownedInputIds).toEqual([
-      '0x0000000000000000000000000000000000000000000000000000000000000042',
-    ])
+    expect(validate(txBytes, policies).ownedInputIds).toEqual([objectId])
   })
 
-  test('rejects tx where embedded sender ≠ expected sender', async () => {
-    const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::fn`] },
-    ])
-    const txBytes = await buildTxBytes(
-      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
-      { sender: SENDER },
+  test('all deny variants override every allow independent of source order', async () => {
+    const txBytes = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::mod::fn` }),
     )
-    expect(() =>
-      validate(txBytes, policies, {
-        sender: '0x0000000000000000000000000000000000000000000000000000000000000099',
-      }),
-    ).toThrow(/sender/)
+    for (const deny of [
+      { type: 'deny', name: 'stop', when: { kind: 'always' } },
+      {
+        type: 'deny',
+        name: 'stop',
+        when: { kind: 'sender', addresses: [SENDER] },
+      },
+      {
+        type: 'deny',
+        name: 'stop',
+        when: { kind: 'any-move-call', targets: [`${PKG}::mod::*`] },
+      },
+    ]) {
+      const policies = loadPolicies([allow(), deny])
+      expect(() => validate(txBytes, policies)).toThrow(/denied by policy: stop/)
+    }
   })
 
-  test('rejects tx where embedded gas owner ≠ expected sponsor', async () => {
+  test('disabled and nonmatching denies do not block', async () => {
     const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::fn`] },
+      {
+        type: 'deny',
+        name: 'disabled',
+        enabled: false,
+        when: { kind: 'always' },
+      },
+      {
+        type: 'deny',
+        name: 'other',
+        when: { kind: 'any-move-call', targets: [`${OTHER_PKG}::*`] },
+      },
+      allow(),
     ])
-    const txBytes = await buildTxBytes(
-      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
-      { sponsor: SPONSOR },
+    const txBytes = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::mod::fn` }),
     )
-    expect(() =>
-      validate(txBytes, policies, {
-        sponsor: '0x0000000000000000000000000000000000000000000000000000000000000099',
-      }),
-    ).toThrow(/gas owner/)
+    expect(branchNames(validate(txBytes, policies))).toEqual(['allow'])
   })
 })
 
-// ─── Constraint mode ──────────────────────────────────────────────────────────
-
-describe('constraint mode', () => {
-  test('accepts valid tx matching exact targets', async () => {
+describe('set and sequence call algebra', () => {
+  test('set mode allows any order and unconstrained multiplicity when count is absent', async () => {
     const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::fn`] },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::mod::fn` }),
-    )
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('p')
-  })
-
-  test('rejects disallowed target', async () => {
-    const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::fn`] },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::mod::evil` }),
-    )
-    expect(() => validate(txBytes, policies)).toThrow(/not allowed/)
-  })
-
-  test('rejects too many commands (maxCommands)', async () => {
-    const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::fn`], maxCommands: 1 },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/too many commands/)
-  })
-
-  test('rejects non-MoveCall command (allowedCommandKinds)', async () => {
-    const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::fn`] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      const result = tx.moveCall({ target: `${PKG}::mod::fn` })
-      tx.transferObjects([result], SENDER)
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/command kind not allowed/)
-  })
-
-  test('enforces callLimits min', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::fn`],
-        callLimits: { [`${PKG}::mod::fn`]: { min: 2 } },
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::mod::fn` }),
-    )
-    expect(() => validate(txBytes, policies)).toThrow(/too few times/)
-  })
-
-  test('enforces callLimits max', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::fn`],
-        callLimits: { [`${PKG}::mod::fn`]: { max: 1 } },
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/too many times/)
-  })
-
-  test('enforces countMatch (matching count passes; mismatch rejects)', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::a`, `${PKG}::mod::b`],
-        callLimits: {
-          [`${PKG}::mod::a`]: { countMatch: `${PKG}::mod::b` },
+      allow({
+        calls: {
+          mode: 'set',
+          rules: [
+            { id: 'a', targets: [`${PKG}::m::a`] },
+            { id: 'b', targets: [`${PKG}::m::b`] },
+          ],
         },
-      },
-    ])
-
-    // Matching counts — should pass
-    const txBytesPass = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::a` })
-      tx.moveCall({ target: `${PKG}::mod::b` })
-    })
-    expect(validate(txBytesPass, policies).matchedPolicyName).toBe('p')
-
-    // Mismatching counts — should fail
-    const txBytesFail = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::a` })
-      tx.moveCall({ target: `${PKG}::mod::b` })
-      tx.moveCall({ target: `${PKG}::mod::b` })
-    })
-    expect(() => validate(txBytesFail, policies)).toThrow(/count.*must match/)
-  })
-
-  test('enforces ordering (correct order passes; wrong order rejects)', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::first`, `${PKG}::mod::second`],
-        ordering: [
-          { before: `${PKG}::mod::first`, after: `${PKG}::mod::second` },
-        ],
-      },
-    ])
-
-    // Correct order
-    const txBytesPass = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::first` })
-      tx.moveCall({ target: `${PKG}::mod::second` })
-    })
-    expect(validate(txBytesPass, policies).matchedPolicyName).toBe('p')
-
-    // Wrong order
-    const txBytesFail = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::second` })
-      tx.moveCall({ target: `${PKG}::mod::first` })
-    })
-    expect(() => validate(txBytesFail, policies)).toThrow(/ordering/)
-  })
-})
-
-// ─── Wildcards ────────────────────────────────────────────────────────────────
-
-describe('wildcards', () => {
-  test('module wildcard matches any function in module', async () => {
-    const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::mod::*`] },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::mod::any_function` }),
-    )
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('p')
-  })
-
-  test('package wildcard matches any module/function', async () => {
-    const policies = loadPolicies([
-      { name: 'p', targets: [`${PKG}::*`] },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::any_mod::any_fn` }),
-    )
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('p')
-  })
-})
-
-// ─── Sequence mode ────────────────────────────────────────────────────────────
-
-describe('sequence mode', () => {
-  test('accepts valid sequence', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'seq',
-        sequence: [
-          { id: 'step1', targets: [`${PKG}::mod::a`] },
-          { id: 'step2', targets: [`${PKG}::mod::b`] },
-        ],
-      },
+      }),
     ])
     const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::a` })
-      tx.moveCall({ target: `${PKG}::mod::b` })
+      tx.moveCall({ target: `${PKG}::m::b` })
+      tx.moveCall({ target: `${PKG}::m::a` })
+      tx.moveCall({ target: `${PKG}::m::a` })
     })
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('seq')
+    expect(branchNames(validate(txBytes, policies))).toEqual(['allow'])
   })
 
-  test('rejects too few calls for a step', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'seq',
-        sequence: [
-          { id: 'step1', targets: [`${PKG}::mod::a`], count: 2 },
-          { id: 'step2', targets: [`${PKG}::mod::b`] },
-        ],
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::a` })
-      tx.moveCall({ target: `${PKG}::mod::b` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/at least/)
-  })
-
-  test('rejects extra calls after sequence ends', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'seq',
-        sequence: [{ id: 'step1', targets: [`${PKG}::mod::a`] }],
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::a` })
-      tx.moveCall({ target: `${PKG}::mod::a` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/unexpected commands/)
-  })
-})
-
-// ─── Result flow ──────────────────────────────────────────────────────────────
-
-describe('result flow', () => {
-  test('accepts result consumed by allowed target', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::produce`, `${PKG}::mod::consume`],
-        resultFlow: [
+  test('set mode enforces ranges, sameAs, and ordering', async () => {
+    const policy = allow({
+      calls: {
+        mode: 'set',
+        rules: [
           {
-            from: `${PKG}::mod::produce`,
-            to: [`${PKG}::mod::consume`],
-            required: true,
+            id: 'a',
+            targets: [`${PKG}::m::a`],
+            count: { min: 1, max: 2 },
+          },
+          {
+            id: 'b',
+            targets: [`${PKG}::m::b`],
+            count: { sameAs: 'a' },
           },
         ],
+        ordering: [{ before: 'a', after: 'b' }],
       },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      const result = tx.moveCall({ target: `${PKG}::mod::produce` })
-      tx.moveCall({
-        target: `${PKG}::mod::consume`,
-        arguments: [result],
-      })
     })
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('p')
+    const policies = loadPolicies([policy])
+    const valid = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::m::a` })
+      tx.moveCall({ target: `${PKG}::m::b` })
+    })
+    expect(branchNames(validate(valid, policies))).toEqual(['allow'])
+
+    const wrongOrder = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::m::b` })
+      tx.moveCall({ target: `${PKG}::m::a` })
+    })
+    expect(() => validate(wrongOrder, policies)).toThrow(/ordering/)
+
+    const wrongCount = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::m::a` })
+      tx.moveCall({ target: `${PKG}::m::a` })
+      tx.moveCall({ target: `${PKG}::m::b` })
+    })
+    expect(() => validate(wrongCount, policies)).toThrow(/must equal/)
   })
 
-  test('rejects unconsumed result when required: true', async () => {
+  test('sequence mode defaults each rule to exactly one and supports optional ranges', async () => {
     const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::produce`, `${PKG}::mod::consume`],
-        resultFlow: [
-          {
-            from: `${PKG}::mod::produce`,
-            to: [`${PKG}::mod::consume`],
-            required: true,
-          },
-        ],
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::produce` })
-      tx.moveCall({ target: `${PKG}::mod::consume` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/result must be consumed/)
-  })
-
-  test('rejects result consumed by disallowed target', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${PKG}::mod::produce`, `${PKG}::mod::ok`, `${PKG}::mod::bad`],
-        resultFlow: [
-          {
-            from: `${PKG}::mod::produce`,
-            to: [`${PKG}::mod::ok`],
-            required: false,
-          },
-        ],
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      const result = tx.moveCall({ target: `${PKG}::mod::produce` })
-      tx.moveCall({
-        target: `${PKG}::mod::bad`,
-        arguments: [result],
-      })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/disallowed/)
-  })
-})
-
-// ─── Type arguments ───────────────────────────────────────────────────────────
-
-describe('type arguments', () => {
-  const SUI_TYPE = `${SUI_PKG}::sui::SUI`
-
-  test('accepts correct type argument', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${SUI_PKG}::coin::zero`],
-        typeArguments: {
-          [`${SUI_PKG}::coin::zero`]: { '0': [SUI_TYPE] },
+      allow({
+        calls: {
+          mode: 'sequence',
+          rules: [
+            {
+              id: 'optional',
+              targets: [`${PKG}::m::optional`],
+              count: { min: 0, max: 1 },
+            },
+            { id: 'a', targets: [`${PKG}::m::a`] },
+            { id: 'b', targets: [`${PKG}::m::b`] },
+          ],
         },
-      },
+      }),
     ])
-    const txBytes = await buildTxBytes((tx) =>
+    const valid = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::m::a` })
+      tx.moveCall({ target: `${PKG}::m::b` })
+    })
+    expect(branchNames(validate(valid, policies))).toEqual(['allow'])
+
+    const duplicate = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::m::a` })
+      tx.moveCall({ target: `${PKG}::m::a` })
+      tx.moveCall({ target: `${PKG}::m::b` })
+    })
+    expect(() => validate(duplicate, policies)).toThrow(/exactly 1/)
+
+    const wrongOrder = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::m::b` })
+      tx.moveCall({ target: `${PKG}::m::a` })
+    })
+    expect(() => validate(wrongOrder, policies)).toThrow(/out-of-sequence/)
+  })
+
+  test('target wildcards normalize package addresses', async () => {
+    const policies = loadPolicies([
+      allow({
+        calls: {
+          mode: 'set',
+          rules: [{ id: 'pkg', targets: ['0xabc::*'] }],
+        },
+      }),
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::one::a` })
+      tx.moveCall({ target: `${PKG}::two::b` })
+    })
+    expect(branchNames(validate(txBytes, policies))).toEqual(['allow'])
+  })
+
+  test('type argument constraints apply to every rule occurrence', async () => {
+    const allowedType = `${PKG}::coin::COIN`
+    const policies = loadPolicies([
+      allow({
+        calls: {
+          mode: 'set',
+          rules: [
+            {
+              id: 'typed',
+              targets: [`${PKG}::m::typed`],
+              typeArguments: { '0': [allowedType] },
+            },
+          ],
+        },
+      }),
+    ])
+    const valid = await buildTxBytes((tx) =>
       tx.moveCall({
-        target: `${SUI_PKG}::coin::zero`,
-        typeArguments: [SUI_TYPE],
+        target: `${PKG}::m::typed`,
+        typeArguments: [allowedType],
       }),
     )
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('p')
-  })
-
-  test('rejects wrong type argument', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'p',
-        targets: [`${SUI_PKG}::coin::zero`],
-        typeArguments: {
-          [`${SUI_PKG}::coin::zero`]: { '0': [SUI_TYPE] },
-        },
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
+    expect(branchNames(validate(valid, policies))).toEqual(['allow'])
+    const wrong = await buildTxBytes((tx) =>
       tx.moveCall({
-        target: `${SUI_PKG}::coin::zero`,
-        typeArguments: [`${PKG}::fake::FAKE`],
+        target: `${PKG}::m::typed`,
+        typeArguments: [`${OTHER_PKG}::coin::COIN`],
       }),
     )
-    expect(() => validate(txBytes, policies)).toThrow(/type argument.*not allowed/)
+    expect(() => validate(wrong, policies)).toThrow(/not allowed/)
   })
-})
 
-// ─── Soft skips ───────────────────────────────────────────────────────────────
-
-describe('soft skips', () => {
-  test('skips disabled policy, falls through to enabled one', async () => {
+  test('enforces total command kinds/max and per-branch gas caps as selectors', async () => {
     const policies = loadPolicies([
-      { name: 'disabled', enabled: false, targets: [`${PKG}::mod::fn`] },
-      { name: 'enabled', targets: [`${PKG}::mod::fn`] },
+      allow({ name: 'small', gasBudgetMax: '9' }),
+      allow({ name: 'large', gasBudgetMax: '10000000' }),
     ])
     const txBytes = await buildTxBytes((tx) =>
       tx.moveCall({ target: `${PKG}::mod::fn` }),
     )
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('enabled')
+    expect(branchNames(validate(txBytes, policies))).toEqual(['large'])
+
+    const maxOne = loadPolicies([
+      allow({ commands: { allowed: ['MoveCall'], max: 1 } }),
+    ])
+    const two = await buildTxBytes((tx) => {
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    expect(() => validate(two, maxOne)).toThrow(/too many commands/)
   })
 
-  test('skips policy with sender restriction, falls through', async () => {
-    const otherSender = '0x0000000000000000000000000000000000000000000000000000000000000099'
+  test('sender and SuiNS gates select branches without first-match locking', async () => {
     const policies = loadPolicies([
-      { name: 'restricted', targets: [`${PKG}::mod::fn`], senders: { static: [otherSender] } },
-      { name: 'open', targets: [`${PKG}::mod::fn`] },
+      allow({ name: 'other-sender', senders: ['0x3'] }),
+      allow({ name: 'name', suinsNames: ['*.onara.sui'] }),
+      allow({ name: 'fallback' }),
     ])
     const txBytes = await buildTxBytes((tx) =>
       tx.moveCall({ target: `${PKG}::mod::fn` }),
     )
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('open')
-  })
-
-  test('skips policy with gas budget exceeded, falls through', async () => {
-    const policies = loadPolicies([
-      { name: 'tight', targets: [`${PKG}::mod::fn`], gasBudgetMax: 1_000 },
-      { name: 'generous', targets: [`${PKG}::mod::fn`] },
+    expect(branchNames(validate(txBytes, policies, 'alice.onara.sui'))).toEqual([
+      'name',
+      'fallback',
     ])
-    const txBytes = await buildTxBytes(
-      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
-      { gasBudget: 10_000_000 },
-    )
-    expect(validate(txBytes, policies).matchedPolicyName).toBe('generous')
-  })
-})
-
-// ─── Dynamic sender whitelist ─────────────────────────────────────────────────
-
-describe('dynamic senders', () => {
-  test('a sender in the static list needs no dynamic check (static hit skips fetch)', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'combined',
-        targets: [`${PKG}::mod::fn`],
-        senders: {
-          static: [SENDER],
-          dynamic: { url: 'https://example.com/authorize' },
-        },
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::mod::fn` }),
-    )
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('combined')
-    // No dynamic check needed — the caller must not make an HTTP call.
-    expect(result.dynamicSenders).toBeNull()
-  })
-
-  test('a sender not in the static list needs a dynamic check (static miss calls dynamic)', async () => {
-    const otherSender =
-      '0x0000000000000000000000000000000000000000000000000000000000000099'
-    const policies = loadPolicies([
-      {
-        name: 'combined',
-        targets: [`${PKG}::mod::fn`],
-        senders: {
-          static: [otherSender],
-          dynamic: { url: 'https://example.com/authorize' },
-        },
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::mod::fn` }),
-    )
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('combined')
-    expect(result.dynamicSenders).not.toBeNull()
-    expect(result.dynamicSenders?.url).toBe('https://example.com/authorize')
-  })
-
-  test('dynamic-only senders (no static list) always requires the dynamic check', async () => {
-    const policies = loadPolicies([
-      {
-        name: 'dynamic-only',
-        targets: [`${PKG}::mod::fn`],
-        senders: { dynamic: { url: 'https://example.com/authorize' } },
-      },
-    ])
-    const txBytes = await buildTxBytes((tx) =>
-      tx.moveCall({ target: `${PKG}::mod::fn` }),
-    )
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('dynamic-only')
-    expect(result.dynamicSenders).not.toBeNull()
-  })
-
-  test('a policy with only dynamic senders is not soft-skipped for any sender', async () => {
-    const otherSender =
-      '0x0000000000000000000000000000000000000000000000000000000000000099'
-    const policies = loadPolicies([
-      {
-        name: 'dynamic-only',
-        targets: [`${PKG}::mod::fn`],
-        senders: { dynamic: { url: 'https://example.com/authorize' } },
-      },
-    ])
-    const txBytes = await buildTxBytes(
-      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
-      { sender: otherSender },
-    )
-    const result = validate(txBytes, policies, { sender: otherSender })
-    expect(result.matchedPolicyName).toBe('dynamic-only')
-    expect(result.dynamicSenders).not.toBeNull()
-  })
-})
-
-// ─── Default policy integration ───────────────────────────────────────────────
-
-describe('default policy integration', () => {
-  test('loads policies/default.json, validates coin::zero → coin::destroy_zero flow', async () => {
-    const defaultConfig = await import('../policies/default.json')
-    const policies = loadPolicies([defaultConfig.default ?? defaultConfig])
-
-    const txBytes = await buildTxBytes((tx) => {
-      const coin = tx.moveCall({
-        target: `${SUI_PKG}::coin::zero`,
-        typeArguments: [`${SUI_PKG}::sui::SUI`],
-      })
-      tx.moveCall({
-        target: `${SUI_PKG}::coin::destroy_zero`,
-        arguments: [coin],
-        typeArguments: [`${SUI_PKG}::sui::SUI`],
-      })
-    })
-
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('default-coin-zero-flow')
-    expect(result.calledTargets).toEqual([
-      `${SUI_PKG}::coin::zero`,
-      `${SUI_PKG}::coin::destroy_zero`,
-    ])
-  })
-})
-
-// ─── Universal wildcard ───────────────────────────────────────────────────────
-
-describe('allow-all policy (universal wildcard)', () => {
-  test('targets: ["*"] matches any transaction', async () => {
-    const policies = loadPolicies([{ name: 'allow-all', targets: ['*'] }])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::my_module::my_function` })
-    })
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('allow-all')
-  })
-
-  test('targets: ["*"] matches multiple calls to different packages', async () => {
-    const policies = loadPolicies([{ name: 'allow-all', targets: ['*'] }])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod_a::fn_a` })
-      tx.moveCall({ target: `${SUI_PKG}::coin::zero` })
-    })
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('allow-all')
-    expect(result.calledTargets).toHaveLength(2)
-  })
-})
-
-// ─── Deny policies ───────────────────────────────────────────────────────────
-
-const BAD_PKG = '0x0000000000000000000000000000000000000000000000000000000000000bad'
-
-describe('deny policies', () => {
-  test('deny by target blocks matching transaction', async () => {
-    const policies = loadPolicies([
-      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
-      { name: 'allow-all', targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${BAD_PKG}::exploit::drain` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-bad/)
-  })
-
-  test('deny by sender blocks matching sender', async () => {
-    const policies = loadPolicies([
-      { name: 'block-sender', action: 'deny', senders: { static: [SENDER] } },
-      { name: 'allow-all', targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-sender/)
-  })
-
-  test('deny by sender does not affect other senders', async () => {
-    const otherSender = '0x0000000000000000000000000000000000000000000000000000000000000099'
-    const policies = loadPolicies([
-      { name: 'block-sender', action: 'deny', senders: { static: [SENDER] } },
-      { name: 'allow-all', targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes(
-      (tx) => { tx.moveCall({ target: `${PKG}::mod::fn` }) },
-      { sender: otherSender },
-    )
-    const result = validate(txBytes, policies, { sender: otherSender })
-    expect(result.matchedPolicyName).toBe('allow-all')
-  })
-
-  test('deny does not affect non-matching targets', async () => {
-    const policies = loadPolicies([
-      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
-      { name: 'allow-all', targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    const result = validate(txBytes, policies)
-    expect(result.matchedPolicyName).toBe('allow-all')
-  })
-
-  test('deny fires even when allow-all is listed first in config', async () => {
-    const policies = loadPolicies([
-      { name: 'allow-all', targets: ['*'] },
-      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${BAD_PKG}::exploit::drain` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-bad/)
-  })
-
-  test('deny with any-match: blocks if ANY call matches denied target', async () => {
-    const policies = loadPolicies([
-      { name: 'block-bad', action: 'deny', targets: [`${BAD_PKG}::*`] },
-      { name: 'allow-all', targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-      tx.moveCall({ target: `${BAD_PKG}::exploit::drain` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/denied by policy: block-bad/)
-  })
-
-  test('deny rejects allow-only fields', () => {
-    expect(() => loadPolicies([
-      { name: 'bad-deny', action: 'deny', targets: ['*'], maxCommands: 5 },
-    ])).toThrow(/Deny policies only support targets and senders/)
-  })
-
-  test('deny rejects suinsNames', () => {
-    expect(() => loadPolicies([
-      { name: 'bad-deny', action: 'deny', suinsNames: ['*.evil.sui'] },
-    ])).toThrow(/Deny policies only support targets and senders/)
-  })
-})
-
-// ─── SuiNS name policies ─────────────────────────────────────────────────────
-
-describe('suinsNames policies', () => {
-  test('wildcard *.onara.sui matches alice.onara.sui', async () => {
-    const policies = loadPolicies([
-      { name: 'onara-community', suinsNames: ['*.onara.sui'], targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    const result = validate(txBytes, policies, { senderName: 'alice.onara.sui' })
-    expect(result.matchedPolicyName).toBe('onara-community')
-  })
-
-  test('wildcard *.onara.sui does NOT match onara.sui (DNS RFC 4592)', async () => {
-    const policies = loadPolicies([
-      { name: 'onara-community', suinsNames: ['*.onara.sui'], targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    expect(() =>
-      validate(txBytes, policies, { senderName: 'onara.sui' }),
-    ).toThrow(/did not match any sponsor policy/)
-  })
-
-  test('exact match onara.sui', async () => {
-    const policies = loadPolicies([
-      { name: 'onara-exact', suinsNames: ['onara.sui'], targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    const result = validate(txBytes, policies, { senderName: 'onara.sui' })
-    expect(result.matchedPolicyName).toBe('onara-exact')
-  })
-
-  test('combined wildcard + exact matches both', async () => {
-    const policies = loadPolicies([
-      { name: 'onara-all', suinsNames: ['*.onara.sui', 'onara.sui'], targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    expect(validate(txBytes, policies, { senderName: 'alice.onara.sui' }).matchedPolicyName).toBe('onara-all')
-    expect(validate(txBytes, policies, { senderName: 'onara.sui' }).matchedPolicyName).toBe('onara-all')
-  })
-
-  test('no SuiNS name soft-skips to next policy', async () => {
-    const policies = loadPolicies([
-      { name: 'onara-community', suinsNames: ['*.onara.sui'], targets: ['*'] },
-      { name: 'allow-all', targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    const result = validate(txBytes, policies, { senderName: null })
-    expect(result.matchedPolicyName).toBe('allow-all')
-  })
-
-  test('no SuiNS name with no fallback policy rejects', async () => {
-    const policies = loadPolicies([
-      { name: 'onara-only', suinsNames: ['*.onara.sui'], targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    expect(() =>
-      validate(txBytes, policies, { senderName: null }),
-    ).toThrow(/did not match any sponsor policy/)
-  })
-
-  test('case insensitive matching', async () => {
-    const policies = loadPolicies([
-      { name: 'onara-community', suinsNames: ['*.Sona.SUI'], targets: ['*'] },
-    ])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    const result = validate(txBytes, policies, { senderName: 'Alice.SONA.sui' })
-    expect(result.matchedPolicyName).toBe('onara-community')
-  })
-
-  test('needsSuinsResolution is true when a policy uses suinsNames', () => {
-    const policies = loadPolicies([
-      { name: 'onara', suinsNames: ['*.onara.sui'], targets: ['*'] },
+    expect(branchNames(validate(txBytes, policies, 'onara.sui'))).toEqual([
+      'fallback',
     ])
     expect(policies.needsSuinsResolution).toBe(true)
   })
+})
 
-  test('needsSuinsResolution is false when no policy uses suinsNames', () => {
-    const policies = loadPolicies([
-      { name: 'allow-all', targets: ['*'] },
-    ])
-    expect(policies.needsSuinsResolution).toBe(false)
+function flowPolicy(options: {
+  sourceResult?: number
+  destinationArgument?: number
+  required?: boolean
+  producerCount?: { min?: number; max?: number }
+  allowedKinds?: string[]
+} = {}) {
+  return allow({
+    commands: {
+      allowed: options.allowedKinds ?? ['MoveCall'],
+      max: 10,
+    },
+    calls: {
+      mode: 'set',
+      rules: [
+        {
+          id: 'produce',
+          targets: [`${PKG}::flow::produce`],
+          count: options.producerCount,
+        },
+        { id: 'consume', targets: [`${PKG}::flow::consume`] },
+        { id: 'other', targets: [`${PKG}::flow::other`] },
+      ],
+      resultFlow: [
+        {
+          from: { rule: 'produce', result: options.sourceResult ?? 0 },
+          to: [
+            {
+              rule: 'consume',
+              argument: options.destinationArgument ?? 0,
+            },
+          ],
+          ...(options.required === undefined
+            ? {}
+            : { required: options.required }),
+        },
+      ],
+    },
   })
+}
+
+describe('exact result-flow graph', () => {
+  test('accepts Result as exact slot 0 at the allowed top-level argument', async () => {
+    const policies = loadPolicies([flowPolicy()])
+    const txBytes = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({
+        target: `${PKG}::flow::consume`,
+        arguments: [produced],
+      })
+    })
+    expect(branchNames(validate(txBytes, policies))).toEqual(['allow'])
+  })
+
+  test('accepts NestedResult only for the exact configured slot', async () => {
+    const policies = loadPolicies([flowPolicy({ sourceResult: 1 })])
+    const valid = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({
+        target: `${PKG}::flow::consume`,
+        arguments: [produced[1]!],
+      })
+    })
+    expect(branchNames(validate(valid, policies))).toEqual(['allow'])
+
+    const wrongSlot = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({
+        target: `${PKG}::flow::consume`,
+        arguments: [produced],
+      })
+    })
+    expect(() => validate(wrongSlot, policies)).toThrow(/must be consumed/)
+  })
+
+  test('required defaults true and is enforced for every producer occurrence', async () => {
+    const policies = loadPolicies([
+      flowPolicy({ producerCount: { min: 2, max: 2 } }),
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      const first = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({
+        target: `${PKG}::flow::consume`,
+        arguments: [first],
+      })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/must be consumed/)
+  })
+
+  test('required false permits no use but still constrains every actual use', async () => {
+    const policies = loadPolicies([flowPolicy({ required: false })])
+    const unused = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::flow::produce` }),
+    )
+    expect(branchNames(validate(unused, policies))).toEqual(['allow'])
+
+    const wrongUse = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({
+        target: `${PKG}::flow::other`,
+        arguments: [produced],
+      })
+    })
+    expect(() => validate(wrongUse, policies)).toThrow(/disallowed other/)
+  })
+
+  test('rejects a correct consumer rule at the wrong argument index', async () => {
+    const policies = loadPolicies([flowPolicy()])
+    const txBytes = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({
+        target: `${PKG}::flow::consume`,
+        arguments: [tx.pure.u64(1), produced],
+      })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/argument 1/)
+  })
+
+  test('rejects if any use is disallowed even when another use is allowed', async () => {
+    const policies = loadPolicies([flowPolicy()])
+    const txBytes = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({
+        target: `${PKG}::flow::consume`,
+        arguments: [produced],
+      })
+      tx.moveCall({
+        target: `${PKG}::flow::other`,
+        arguments: [produced],
+      })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/disallowed other/)
+  })
+
+  test('recursively rejects constrained slots in every argument-bearing native command', async () => {
+    const cases: {
+      kind: string
+      setup: (tx: Transaction, produced: ReturnType<Transaction['moveCall']>) => void
+    }[] = [
+      {
+        kind: 'TransferObjects',
+        setup: (tx, produced) =>
+          tx.transferObjects([produced], produced),
+      },
+      {
+        kind: 'SplitCoins',
+        setup: (tx, produced) => {
+          tx.splitCoins(produced, [produced])
+        },
+      },
+      {
+        kind: 'MergeCoins',
+        setup: (tx, produced) => {
+          tx.mergeCoins(produced, [produced])
+        },
+      },
+      {
+        kind: 'MakeMoveVec',
+        setup: (tx, produced) => {
+          tx.makeMoveVec({
+            type: `${PKG}::flow::Value`,
+            elements: [produced],
+          })
+        },
+      },
+      {
+        kind: 'Upgrade',
+        setup: (tx, produced) => {
+          tx.upgrade({
+            modules: [[1]],
+            dependencies: [],
+            package: PKG,
+            ticket: produced,
+          })
+        },
+      },
+    ]
+
+    for (const fixture of cases) {
+      const policies = loadPolicies([
+        flowPolicy({
+          required: false,
+          allowedKinds: ['MoveCall', fixture.kind],
+        }),
+      ])
+      const txBytes = await buildTxBytes((tx) => {
+        const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+        fixture.setup(tx, produced)
+      })
+      expect(() => validate(txBytes, policies), fixture.kind).toThrow(
+        /native or non-top-level/,
+      )
+    }
+  })
+
+  test('a flow for slot 1 does not constrain a slot-0 use when optional', async () => {
+    const policies = loadPolicies([
+      flowPolicy({ sourceResult: 1, required: false }),
+    ])
+    const txBytes = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({ target: `${PKG}::flow::other`, arguments: [produced] })
+    })
+    expect(branchNames(validate(txBytes, policies))).toEqual(['allow'])
+  })
+})
+
+describe('allow-branch and requirement truth algebra', () => {
+  function requirementPlan(): PolicyEvaluationPlan {
+    const policies = loadPolicies([
+      requirement('one'),
+      requirement('two'),
+      allow({ name: 'first', requires: ['one', 'two'] }),
+      allow({ name: 'second', requires: ['one'] }),
+    ])
+    return {
+      calledTargets: [],
+      ownedInputIds: [],
+      allowBranches: policies.allow.map((policy) => ({
+        policyName: policy.name,
+        requirements: policy.requirements,
+      })),
+    }
+  }
+
+  test('synchronous validation returns every complete structural allow branch', async () => {
+    const policies = loadPolicies([
+      requirement(),
+      allow({ name: 'legacy', requires: ['sender-ok'] }),
+      allow({ name: 'current', requires: ['sender-ok'] }),
+    ])
+    const txBytes = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::mod::fn` }),
+    )
+    expect(branchNames(validate(txBytes, policies))).toEqual([
+      'legacy',
+      'current',
+    ])
+  })
+
+  test('AND: false dominates unknown within a branch', async () => {
+    const result = await evaluatePolicyRequirements({
+      allowBranches: [requirementPlan().allowBranches[0]!],
+      evaluate: async ({ requirement: item }) =>
+        item.name === 'one' ? 'unavailable' : 'deny',
+    })
+    expect(result).toEqual({ status: 'denied' })
+  })
+
+  test('OR: any passing branch wins over denied or unavailable branches', async () => {
+    const seen: string[] = []
+    const result = await evaluatePolicyRequirements({
+      allowBranches: requirementPlan().allowBranches,
+      evaluate: async ({ requirement: item, policyName }) => {
+        seen.push(`${item.name}:${policyName}`)
+        if (policyName === 'first') return 'unavailable'
+        return 'allow'
+      },
+    })
+    expect(result).toEqual({ status: 'allowed', policyName: 'second' })
+    expect(seen).toEqual(['one:first', 'two:first', 'one:second'])
+  })
+
+  test('OR returns unavailable iff no branch passes and at least one remains unknown', async () => {
+    const result = await evaluatePolicyRequirements({
+      allowBranches: requirementPlan().allowBranches,
+      evaluate: async ({ policyName }) =>
+        policyName === 'first' ? 'unavailable' : 'deny',
+    })
+    expect(result).toEqual({ status: 'unavailable' })
+  })
+
+  test('OR returns denied when every branch is false', async () => {
+    const result = await evaluatePolicyRequirements({
+      allowBranches: requirementPlan().allowBranches,
+      evaluate: async () => 'deny',
+    })
+    expect(result).toEqual({ status: 'denied' })
+  })
+
+  test('an explicit public branch requires no external evaluation', async () => {
+    let calls = 0
+    const result = await evaluatePolicyRequirements({
+      allowBranches: [{ policyName: 'public', requirements: [] }],
+      evaluate: async () => {
+        calls++
+        return 'deny'
+      },
+    })
+    expect(result).toEqual({ status: 'allowed', policyName: 'public' })
+    expect(calls).toBe(0)
+  })
+})
+
+describe('real policy/config integration', () => {
+  test('default coin::zero slot-0 flow validates', async () => {
+    const policies = loadPolicies([defaultPolicy])
+    const txBytes = await buildTxBytes((tx) => {
+      const coin = tx.moveCall({
+        target: '0x2::coin::zero',
+        typeArguments: ['0x2::sui::SUI'],
+      })
+      tx.moveCall({
+        target: '0x2::coin::destroy_zero',
+        typeArguments: ['0x2::sui::SUI'],
+        arguments: [coin],
+      })
+    })
+    expect(branchNames(validate(txBytes, policies))).toEqual([
+      'default-coin-zero-flow',
+    ])
+  })
+
 })

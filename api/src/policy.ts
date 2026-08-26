@@ -1,150 +1,157 @@
 import { z } from 'zod'
 import { Transaction } from '@mysten/sui/transactions'
 import {
+  isValidSuiAddress,
   normalizeStructTag,
   normalizeSuiAddress,
   normalizeSuiObjectId,
-  isValidSuiAddress,
 } from '@mysten/sui/utils'
 
-// ─── Utilities ───────────────────────────────────────────────────────────────
+// Schema-v1 is deliberately a small algebra:
+//
+//   deny rules override everything
+//   allow branches are ORed
+//   named requirements inside one allow branch are ANDed
+//
+// Transaction structure is evaluated synchronously here. External
+// requirements are returned as an explicit plan and evaluated by the app.
 
-const getMoveCallTarget = ({
-  packageId,
-  module,
-  functionName,
-}: {
-  packageId: string
-  module: string
-  functionName: string
-}) => `${normalizeSuiAddress(packageId)}::${module}::${functionName}`
+const COMMAND_KINDS = [
+  'MoveCall',
+  'TransferObjects',
+  'SplitCoins',
+  'MergeCoins',
+  'MakeMoveVec',
+  'Publish',
+  'Upgrade',
+] as const
 
-// ─── Target Pattern System ───────────────────────────────────────────────────
+export type PolicyCommandKind = (typeof COMMAND_KINDS)[number]
 
-type UniversalPattern = { kind: 'universal' }
-type ExactPattern = { kind: 'exact'; target: string }
-type ModulePattern = { kind: 'module'; prefix: string }
-type PackagePattern = { kind: 'package'; prefix: string }
-type TargetPattern = UniversalPattern | ExactPattern | ModulePattern | PackagePattern
+const VISIBLE_ASCII = /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/
+const DECIMAL_POSITIVE = /^[1-9]\d*$/
+const INDEX = /^(0|[1-9]\d*)$/
 
-const normalizePackageAddress = (raw: string, pattern: string): string => {
-  const normalized = normalizeSuiAddress(raw)
-  if (!isValidSuiAddress(normalized)) {
-    throw new Error(`Invalid package address in pattern: ${pattern}`)
-  }
-  return normalized
+const unique = <T>(values: readonly T[]): boolean =>
+  new Set(values).size === values.length
+
+const namedValueSchema = (field: string) =>
+  z
+    .string()
+    .min(1)
+    .max(256)
+    .regex(
+      VISIBLE_ASCII,
+      `${field} must contain only visible ASCII with no leading or trailing whitespace.`,
+    )
+
+const uniqueStringsSchema = (field: string, allowEmpty = false) => {
+  const schema = z.array(z.string().min(1))
+  return (allowEmpty ? schema : schema.min(1)).refine(
+    unique,
+    `${field} must not contain duplicates.`,
+  )
 }
 
-const parseTargetPattern = (raw: string): TargetPattern => {
-  if (raw.trim() === '*') return { kind: 'universal' }
+const canonicalAddressSchema = z.string().refine(
+  (value) =>
+    isValidSuiAddress(value) && normalizeSuiAddress(value) === value,
+  'Expected a canonical Sui address.',
+)
 
-  const parts = raw.trim().split('::')
+const addressSchema = z
+  .string()
+  .refine(
+    (value) => isValidSuiAddress(normalizeSuiAddress(value)),
+    'Expected a valid Sui address.',
+  )
 
-  if (parts.length === 2 && parts[1] === '*') {
-    return {
-      kind: 'package',
-      prefix: normalizePackageAddress(parts[0]!, raw),
-    }
-  }
+const isLocalHostname = (hostname: string): boolean =>
+  hostname === 'localhost' || hostname === '127.0.0.1'
 
-  if (parts.length === 3 && parts[2] === '*') {
-    return {
-      kind: 'module',
-      prefix: `${normalizePackageAddress(parts[0]!, raw)}::${parts[1]}`,
-    }
-  }
+const envVarNameSchema = z
+  .string()
+  .regex(
+    /^[A-Za-z_][A-Za-z0-9_]*$/,
+    'signingKeyEnv must be a valid environment variable name.',
+  )
 
-  if (parts.length === 3) {
-    return {
-      kind: 'exact',
-      target: `${normalizePackageAddress(parts[0]!, raw)}::${parts[1]}::${parts[2]}`,
-    }
-  }
-
-  throw new Error(`Invalid target pattern format: ${raw}`)
-}
-
-type TargetMatcher = {
-  matchAll: boolean
-  exact: Set<string>
-  modules: Set<string>
-  packages: Set<string>
-}
-
-const buildTargetMatcher = (patterns: TargetPattern[]): TargetMatcher => {
-  let matchAll = false
-  const exact = new Set<string>()
-  const modules = new Set<string>()
-  const packages = new Set<string>()
-
-  for (const p of patterns) {
-    switch (p.kind) {
-      case 'universal':
-        matchAll = true
-        break
-      case 'exact':
-        exact.add(p.target)
-        break
-      case 'module':
-        modules.add(p.prefix)
-        break
-      case 'package':
-        packages.add(p.prefix)
-        break
-    }
-  }
-
-  return { matchAll, exact, modules, packages }
-}
-
-const matchTarget = (target: string, matcher: TargetMatcher): boolean => {
-  if (matcher.matchAll) return true
-  if (matcher.exact.size > 0 && matcher.exact.has(target)) return true
-
-  if (matcher.modules.size > 0) {
-    const lastSep = target.lastIndexOf('::')
-    if (lastSep !== -1 && matcher.modules.has(target.slice(0, lastSep)))
-      return true
-  }
-
-  if (matcher.packages.size > 0) {
-    const firstSep = target.indexOf('::')
-    if (firstSep !== -1 && matcher.packages.has(target.slice(0, firstSep)))
-      return true
-  }
-
-  return false
-}
-
-// ─── SuiNS Name Pattern System ───────────────────────────────────────────────
-
-type SuinsNamePattern =
-  | { kind: 'exact'; name: string }
-  | { kind: 'wildcard'; suffix: string }
-
-const parseSuinsNamePattern = (raw: string): SuinsNamePattern => {
-  const trimmed = raw.trim().toLowerCase()
-  if (trimmed.startsWith('*.')) {
-    return { kind: 'wildcard', suffix: trimmed.slice(1) } // e.g., ".sona.sui"
-  }
-  return { kind: 'exact', name: trimmed }
-}
-
-const matchSuinsName = (
-  name: string | null,
-  patterns: SuinsNamePattern[],
-): boolean => {
-  if (name === null) return false
-  const normalized = name.toLowerCase()
-  return patterns.some((p) => {
-    if (p.kind === 'exact') return normalized === p.name
-    return normalized.endsWith(p.suffix) && normalized.length > p.suffix.length
+const dynamicSenderCheckSchema = z
+  .object({
+    kind: z.literal('sender.dynamic'),
+    url: z.string().min(1),
+    audience: namedValueSchema('check.audience'),
+    signingKeyEnv: envVarNameSchema,
+    signingIdentity: canonicalAddressSchema,
+    timeoutMs: z.number().int().positive().default(1500),
+    cacheTtlSeconds: z
+      .number()
+      .int()
+      .nonnegative()
+      .default(0)
+      .refine(
+        (value) => value === 0 || value >= 60,
+        'check.cacheTtlSeconds must be 0 or at least 60.',
+      ),
   })
-}
+  .strict()
+  .refine((check) => {
+    try {
+      const url = new URL(check.url)
+      return (
+        url.protocol === 'https:' ||
+        (url.protocol === 'http:' && isLocalHostname(url.hostname))
+      )
+    } catch {
+      return false
+    }
+  }, 'check.url must be https:// (http:// is only allowed for localhost/127.0.0.1).')
 
-// ─── Zod Schemas ─────────────────────────────────────────────────────────────
+export type DynamicSenderCheck = z.infer<typeof dynamicSenderCheckSchema>
 
-const callLimitRangeSchema = z
+const requirePolicySchema = z
+  .object({
+    type: z.literal('require'),
+    name: namedValueSchema('Requirement name'),
+    enabled: z.boolean().default(true),
+    check: dynamicSenderCheckSchema,
+  })
+  .strict()
+
+const denyAlwaysSchema = z.object({ kind: z.literal('always') }).strict()
+const denyMoveCallSchema = z
+  .object({
+    kind: z.literal('any-move-call'),
+    targets: uniqueStringsSchema('when.targets'),
+  })
+  .strict()
+const denySenderSchema = z
+  .object({
+    kind: z.literal('sender'),
+    addresses: z
+      .array(addressSchema)
+      .min(1)
+      .refine(
+        (addresses) => unique(addresses.map((address) => normalizeSuiAddress(address))),
+        'when.addresses must not contain duplicate addresses.',
+      ),
+  })
+  .strict()
+
+const denyPolicySchema = z
+  .object({
+    type: z.literal('deny'),
+    name: namedValueSchema('Deny policy name'),
+    enabled: z.boolean().default(true),
+    when: z.discriminatedUnion('kind', [
+      denyAlwaysSchema,
+      denyMoveCallSchema,
+      denySenderSchema,
+    ]),
+  })
+  .strict()
+
+const countRangeSchema = z
   .object({
     min: z.number().int().nonnegative().optional(),
     max: z.number().int().nonnegative().optional(),
@@ -152,676 +159,903 @@ const callLimitRangeSchema = z
   .strict()
   .refine(
     ({ min, max }) => min !== undefined || max !== undefined,
-    'At least one of min or max is required.',
+    'count requires min or max.',
   )
   .refine(
     ({ min, max }) => min === undefined || max === undefined || min <= max,
-    'min cannot be greater than max.',
+    'count.min cannot exceed count.max.',
   )
 
-const callLimitCountMatchSchema = z
-  .object({
-    countMatch: z.string().trim().min(1),
-  })
+const countSameAsSchema = z
+  .object({ sameAs: z.string().min(1) })
   .strict()
 
-const callLimitSchema = z.union([
-  callLimitRangeSchema,
-  callLimitCountMatchSchema,
-])
-
-const sequenceStepSchema = z
+const callRuleSchema = z
   .object({
-    id: z.string().trim().min(1),
-    targets: z.array(z.string().trim().min(1)).min(1),
-    count: z.number().int().positive().optional(),
-    min: z.number().int().nonnegative().optional(),
-    max: z.number().int().positive().optional(),
-  })
-  .refine(
-    ({ count, min, max }) => {
-      if (count !== undefined && (min !== undefined || max !== undefined))
-        return false
-      return true
-    },
-    'count and min/max are mutually exclusive.',
-  )
-  .refine(
-    ({ min, max }) => min === undefined || max === undefined || min <= max,
-    'min cannot be greater than max.',
-  )
-
-const orderingRuleSchema = z.object({
-  before: z.string().trim().min(1),
-  after: z.string().trim().min(1),
-})
-
-const resultFlowRuleSchema = z.object({
-  from: z.string().trim().min(1),
-  to: z.array(z.string().trim().min(1)).min(1),
-  required: z.boolean().default(true),
-})
-
-const isLocalHostname = (hostname: string): boolean =>
-  hostname === 'localhost' || hostname === '127.0.0.1'
-
-const dynamicSenderConfigSchema = z
-  .object({
-    url: z.string().trim().min(1),
-    timeoutMs: z.number().int().positive().default(1500),
-    // Cloudflare KV rejects expirationTtl < 60; 0 disables caching.
-    cacheTtlSeconds: z
-      .number()
-      .int()
-      .nonnegative()
-      .default(0)
-      .refine(
-        (ttl) => ttl === 0 || ttl >= 60,
-        'senders.dynamic.cacheTtlSeconds must be 0 or at least 60.',
-      ),
-    secretEnv: z.string().trim().min(1).default('DYNAMIC_SENDERS_SECRET'),
-  })
-  .strict()
-  .refine(
-    (data) => {
-      let parsedUrl: URL
-      try {
-        parsedUrl = new URL(data.url)
-      } catch {
-        return false
-      }
-      if (parsedUrl.protocol === 'https:') return true
-      return parsedUrl.protocol === 'http:' && isLocalHostname(parsedUrl.hostname)
-    },
-    'senders.dynamic.url must be https:// (http:// is only allowed for localhost/127.0.0.1).',
-  )
-
-export type DynamicSendersConfig = z.infer<typeof dynamicSenderConfigSchema>
-
-// `senders` is an object with a `static` address list, a `dynamic` endpoint
-// config, or both — at least one is required.
-const sendersSchema = z
-  .object({
-    static: z.array(z.string().trim().min(1)).min(1).optional(),
-    dynamic: dynamicSenderConfigSchema.optional(),
-  })
-  .strict()
-  .refine(
-    (data) => data.static !== undefined || data.dynamic !== undefined,
-    'senders requires at least one of static or dynamic.',
-  )
-
-export type SendersConfig = z.infer<typeof sendersSchema>
-
-const policySchema = z
-  .object({
-    name: z.string().trim().min(1),
-    action: z.enum(['allow', 'deny']).default('allow'),
-    enabled: z.boolean().default(true),
-    senders: sendersSchema.optional(),
-    suinsNames: z.array(z.string().trim().min(1)).optional(),
-    gasBudgetMax: z.number().int().positive().optional(),
-    allowedCommandKinds: z
-      .array(z.string().trim().min(1))
-      .default(['MoveCall']),
-    maxCommands: z.number().int().positive().optional(),
-
-    // Constraint mode
-    targets: z.array(z.string().trim().min(1)).min(1).optional(),
-    callLimits: z.record(z.string(), callLimitSchema).optional(),
-    ordering: z.array(orderingRuleSchema).optional(),
-
-    // Sequence mode
-    sequence: z.array(sequenceStepSchema).min(1).optional(),
-
-    // Both modes
-    resultFlow: z.array(resultFlowRuleSchema).optional(),
+    id: z.string().min(1),
+    targets: uniqueStringsSchema('calls.rules.targets'),
+    count: z.union([countRangeSchema, countSameAsSchema]).optional(),
     typeArguments: z
       .record(
-        z.string(),
-        z.record(z.string(), z.array(z.string().trim().min(1)).min(1)),
+        z.string().regex(INDEX, 'Expected a non-negative integer index.'),
+        uniqueStringsSchema('calls.rules.typeArguments'),
       )
       .optional(),
   })
-  .refine(
-    (data) => {
-      // Deny policies don't require targets or sequence
-      if (data.action === 'deny') return true
-      // Allow policies require exactly one of targets or sequence
-      const hasTargets = data.targets !== undefined
-      const hasSequence = data.sequence !== undefined
-      if (!hasTargets && !hasSequence) return false
-      if (hasTargets && hasSequence) return false
-      return true
-    },
-    'Allow policies require exactly one of targets or sequence.',
-  )
-  .refine(
-    (data) => {
-      if (data.sequence !== undefined) {
-        if (data.callLimits !== undefined || data.ordering !== undefined)
-          return false
-      }
-      return true
-    },
-    'callLimits and ordering are only valid with targets mode.',
-  )
-  .refine(
-    (data) => {
-      if (data.action !== 'deny') return true
-      // Deny policies only support targets and senders
-      if (data.suinsNames !== undefined) return false
-      if (data.sequence !== undefined) return false
-      if (data.callLimits !== undefined) return false
-      if (data.ordering !== undefined) return false
-      if (data.resultFlow !== undefined) return false
-      if (data.typeArguments !== undefined) return false
-      if (data.maxCommands !== undefined) return false
-      if (data.gasBudgetMax !== undefined) return false
-      if (data.senders?.dynamic !== undefined) return false
-      return true
-    },
-    'Deny policies only support targets and senders.',
-  )
+  .strict()
 
-// ─── Compiled Types ──────────────────────────────────────────────────────────
+const orderingSchema = z
+  .object({ before: z.string().min(1), after: z.string().min(1) })
+  .strict()
 
-type CompiledCallLimit =
+const resultConsumerSchema = z
+  .object({
+    rule: z.string().min(1),
+    argument: z.number().int().nonnegative(),
+  })
+  .strict()
+
+const resultFlowSchema = z
+  .object({
+    from: z
+      .object({
+        rule: z.string().min(1),
+        result: z.number().int().nonnegative(),
+      })
+      .strict(),
+    to: z.array(resultConsumerSchema).min(1),
+    required: z.boolean().default(true),
+  })
+  .strict()
+
+const setCallsSchema = z
+  .object({
+    mode: z.literal('set'),
+    rules: z.array(callRuleSchema).min(1),
+    ordering: z.array(orderingSchema).min(1).optional(),
+    resultFlow: z.array(resultFlowSchema).min(1).optional(),
+  })
+  .strict()
+
+const sequenceCallsSchema = z
+  .object({
+    mode: z.literal('sequence'),
+    rules: z.array(callRuleSchema).min(1),
+    resultFlow: z.array(resultFlowSchema).min(1).optional(),
+  })
+  .strict()
+
+const allowPolicySchema = z
+  .object({
+    type: z.literal('allow'),
+    name: namedValueSchema('Allow policy name'),
+    enabled: z.boolean().default(true),
+    requires: uniqueStringsSchema('requires', true),
+    senders: z
+      .array(addressSchema)
+      .min(1)
+      .refine(
+        (addresses) => unique(addresses.map((address) => normalizeSuiAddress(address))),
+        'senders must not contain duplicate addresses.',
+      )
+      .optional(),
+    suinsNames: uniqueStringsSchema('suinsNames').optional(),
+    gasBudgetMax: z
+      .string()
+      .regex(DECIMAL_POSITIVE, 'gasBudgetMax must be a positive decimal string.')
+      .optional(),
+    commands: z
+      .object({
+        allowed: z
+          .array(z.enum(COMMAND_KINDS))
+          .min(1)
+          .refine(unique, 'commands.allowed must not contain duplicates.'),
+        max: z.number().int().positive().optional(),
+      })
+      .strict(),
+    calls: z.discriminatedUnion('mode', [setCallsSchema, sequenceCallsSchema]),
+  })
+  .strict()
+
+const policySchema = z.discriminatedUnion('type', [
+  requirePolicySchema,
+  denyPolicySchema,
+  allowPolicySchema,
+])
+
+// ─── Target patterns ────────────────────────────────────────────────────────
+
+type TargetPattern =
+  | { kind: 'universal' }
+  | { kind: 'package'; package: string }
+  | { kind: 'module'; package: string; module: string }
+  | { kind: 'exact'; package: string; module: string; function: string }
+
+type TargetMatcher = { patterns: TargetPattern[] }
+
+const moveIdentifier = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function normalizePackage(raw: string, original: string): string {
+  const normalized = normalizeSuiAddress(raw)
+  if (!isValidSuiAddress(normalized)) {
+    throw new Error(`Invalid package address in target: ${original}`)
+  }
+  return normalized
+}
+
+function parseTargetPattern(raw: string): TargetPattern {
+  if (raw === '*') return { kind: 'universal' }
+  if (raw !== raw.trim()) {
+    throw new Error(`Target must not contain surrounding whitespace: ${raw}`)
+  }
+  const parts = raw.split('::')
+  if (parts.length === 2 && parts[1] === '*') {
+    return { kind: 'package', package: normalizePackage(parts[0]!, raw) }
+  }
+  if (
+    parts.length === 3 &&
+    parts[2] === '*' &&
+    moveIdentifier.test(parts[1]!)
+  ) {
+    return {
+      kind: 'module',
+      package: normalizePackage(parts[0]!, raw),
+      module: parts[1]!,
+    }
+  }
+  if (
+    parts.length === 3 &&
+    moveIdentifier.test(parts[1]!) &&
+    moveIdentifier.test(parts[2]!)
+  ) {
+    return {
+      kind: 'exact',
+      package: normalizePackage(parts[0]!, raw),
+      module: parts[1]!,
+      function: parts[2]!,
+    }
+  }
+  throw new Error(`Invalid target pattern format: ${raw}`)
+}
+
+function targetPatternKey(pattern: TargetPattern): string {
+  switch (pattern.kind) {
+    case 'universal':
+      return '*'
+    case 'package':
+      return `${pattern.package}::*`
+    case 'module':
+      return `${pattern.package}::${pattern.module}::*`
+    case 'exact':
+      return `${pattern.package}::${pattern.module}::${pattern.function}`
+  }
+}
+
+function patternsOverlap(a: TargetPattern, b: TargetPattern): boolean {
+  if (a.kind === 'universal' || b.kind === 'universal') return true
+  if (a.package !== b.package) return false
+  if (a.kind === 'package' || b.kind === 'package') return true
+  if (a.module !== b.module) return false
+  if (a.kind === 'module' || b.kind === 'module') return true
+  return a.function === b.function
+}
+
+function matchesTarget(target: string, matcher: TargetMatcher): boolean {
+  const [pkg, module, fn] = target.split('::')
+  return matcher.patterns.some((pattern) => {
+    if (pattern.kind === 'universal') return true
+    if (pattern.package !== pkg) return false
+    if (pattern.kind === 'package') return true
+    if (pattern.module !== module) return false
+    return pattern.kind === 'module' || pattern.function === fn
+  })
+}
+
+function getMoveCallTarget(call: {
+  package: string
+  module: string
+  function: string
+}): string {
+  return `${normalizeSuiAddress(call.package)}::${call.module}::${call.function}`
+}
+
+// ─── Compiled policies ──────────────────────────────────────────────────────
+
+type CompiledCount =
   | { kind: 'range'; min?: number; max?: number }
-  | { kind: 'countMatch'; target: string }
+  | { kind: 'sameAs'; rule: string }
 
-type CompiledResultFlowRule = {
-  fromMatcher: TargetMatcher
-  toMatcher: TargetMatcher
+type CompiledCallRule = {
+  id: string
+  matcher: TargetMatcher
+  count: CompiledCount | null
+  typeArguments: Map<number, Set<string>>
+}
+
+type CompiledResultFlow = {
+  from: { rule: string; result: number }
+  to: Set<string>
   required: boolean
 }
 
-type CompiledOrderingRule = {
-  beforeMatcher: TargetMatcher
-  afterMatcher: TargetMatcher
+type CompiledCalls = {
+  mode: 'set' | 'sequence'
+  rules: CompiledCallRule[]
+  ordering: { before: string; after: string }[]
+  resultFlow: CompiledResultFlow[]
 }
 
-type CompiledSequenceStep = {
-  id: string
-  matcher: TargetMatcher
-  min: number
-  max: number
-}
-
-// Compiled `senders`: a static address set and/or a dynamic endpoint config.
-// At least one is non-null whenever the compiled value itself is non-null
-// (enforced by `sendersObjectSchema`'s refine).
-export type CompiledSenders = {
-  static: Set<string> | null
-  dynamic: DynamicSendersConfig | null
-}
-
-export type CompiledPolicy = {
+export type CompiledRequirement = {
+  type: 'require'
   name: string
-  action: 'allow' | 'deny'
   enabled: boolean
-  senders: CompiledSenders | null
+  check: DynamicSenderCheck
+}
+
+export type CompiledDenyPolicy = {
+  type: 'deny'
+  name: string
+  enabled: boolean
+  when:
+    | { kind: 'always' }
+    | { kind: 'any-move-call'; matcher: TargetMatcher }
+    | { kind: 'sender'; addresses: Set<string> }
+}
+
+export type CompiledAllowPolicy = {
+  type: 'allow'
+  name: string
+  enabled: boolean
+  requirementNames: string[]
+  requirements: CompiledRequirement[]
+  senders: Set<string> | null
   suinsNamePatterns: SuinsNamePattern[] | null
   gasBudgetMax: bigint | null
-  allowedCommandKinds: Set<string> | null
+  allowedCommandKinds: Set<PolicyCommandKind>
   maxCommands: number | null
-
-  // Constraint mode
-  targetMatcher: TargetMatcher | null
-  callLimits: Map<string, CompiledCallLimit>
-  orderingRules: CompiledOrderingRule[]
-
-  // Sequence mode
-  sequenceSteps: CompiledSequenceStep[] | null
-
-  // Both modes
-  resultFlowRules: CompiledResultFlowRule[]
-  typeArguments: Map<string, Map<number, Set<string>>>
-}
-
-// True when a sender should not be filtered out of policy matching at the
-// soft-skip stage. A dynamic-senders policy always passes here — the actual
-// allow/deny decision (static hit, or the HTTP check) happens after the
-// policy has otherwise matched, since it may require an async HTTP call.
-const passesSenderGate = (
-  senders: CompiledSenders | null,
-  normalizedSender: string,
-): boolean => {
-  if (!senders) return true
-  if (senders.dynamic) return true
-  return senders.static ? senders.static.has(normalizedSender) : true
+  calls: CompiledCalls
 }
 
 export type CompiledPolicies = {
-  deny: CompiledPolicy[]
-  allow: CompiledPolicy[]
+  require: CompiledRequirement[]
+  deny: CompiledDenyPolicy[]
+  allow: CompiledAllowPolicy[]
+  requirementsByName: Map<string, CompiledRequirement>
   needsSuinsResolution: boolean
 }
 
-// ─── Policy Compilation ──────────────────────────────────────────────────────
+type SuinsNamePattern =
+  | { kind: 'exact'; name: string }
+  | { kind: 'wildcard'; suffix: string }
 
-const compilePolicy = (raw: z.infer<typeof policySchema>): CompiledPolicy => {
-  const name = raw.name
-  const action = raw.action
-
-  // Target matcher (constraint mode)
-  let targetMatcher: TargetMatcher | null = null
-  if (raw.targets) {
-    targetMatcher = buildTargetMatcher(raw.targets.map(parseTargetPattern))
+function parseSuinsNamePattern(raw: string): SuinsNamePattern {
+  const name = raw.toLowerCase()
+  if (name.startsWith('*.')) {
+    return { kind: 'wildcard', suffix: name.slice(1) }
   }
+  return { kind: 'exact', name }
+}
 
-  // Senders
-  const senders: CompiledSenders | null = raw.senders
-    ? {
-        static: raw.senders.static
-          ? new Set(raw.senders.static.map((s) => normalizeSuiAddress(s)))
-          : null,
-        dynamic: raw.senders.dynamic ?? null,
-      }
-    : null
-
-  // SuiNS name patterns
-  const suinsNamePatterns = raw.suinsNames
-    ? raw.suinsNames.map(parseSuinsNamePattern)
-    : null
-
-  // Call limits
-  const callLimits = new Map<string, CompiledCallLimit>()
-  if (raw.callLimits) {
-    for (const [rawTarget, limit] of Object.entries(raw.callLimits)) {
-      const parsed = parseTargetPattern(rawTarget)
-      if (parsed.kind !== 'exact') {
-        throw new Error(
-          `${name}: callLimits keys must be exact targets, got pattern: ${rawTarget}`,
-        )
-      }
-      if (targetMatcher && !matchTarget(parsed.target, targetMatcher)) {
-        throw new Error(
-          `${name}: callLimits target not in allowed targets: ${rawTarget}`,
-        )
-      }
-
-      if ('countMatch' in limit) {
-        const refParsed = parseTargetPattern(limit.countMatch)
-        if (refParsed.kind !== 'exact') {
-          throw new Error(
-            `${name}: countMatch must reference an exact target: ${limit.countMatch}`,
-          )
-        }
-        if (targetMatcher && !matchTarget(refParsed.target, targetMatcher)) {
-          throw new Error(
-            `${name}: countMatch target not in allowed targets: ${limit.countMatch}`,
-          )
-        }
-        callLimits.set(parsed.target, {
-          kind: 'countMatch',
-          target: refParsed.target,
-        })
-      } else {
-        callLimits.set(parsed.target, {
-          kind: 'range',
-          min: limit.min,
-          max: limit.max,
-        })
-      }
-    }
-
-    // No circular countMatch chains
-    for (const [target, limit] of callLimits) {
-      if (limit.kind === 'countMatch') {
-        const ref = callLimits.get(limit.target)
-        if (ref && ref.kind === 'countMatch') {
-          throw new Error(
-            `${name}: circular countMatch chain: ${target} -> ${limit.target}`,
-          )
-        }
-      }
-    }
-  }
-
-  // Ordering rules
-  const orderingRules: CompiledOrderingRule[] = (raw.ordering ?? []).map(
-    (rule) => ({
-      beforeMatcher: buildTargetMatcher([parseTargetPattern(rule.before)]),
-      afterMatcher: buildTargetMatcher([parseTargetPattern(rule.after)]),
-    }),
+function matchSuinsName(
+  name: string | null,
+  patterns: SuinsNamePattern[],
+): boolean {
+  if (name === null) return false
+  const normalized = name.toLowerCase()
+  return patterns.some((pattern) =>
+    pattern.kind === 'exact'
+      ? normalized === pattern.name
+      : normalized.endsWith(pattern.suffix) &&
+        normalized.length > pattern.suffix.length,
   )
+}
 
-  // Sequence steps
-  let sequenceSteps: CompiledSequenceStep[] | null = null
-  if (raw.sequence) {
-    sequenceSteps = raw.sequence.map((step) => {
-      let min: number
-      let max: number
-      if (step.count !== undefined) {
-        min = step.count
-        max = step.count
-      } else if (step.min !== undefined || step.max !== undefined) {
-        min = step.min ?? 0
-        max = step.max ?? Infinity
-      } else {
-        min = 1
-        max = 1
+function compileTargetList(
+  rawTargets: string[],
+  context: string,
+): TargetMatcher {
+  const patterns = rawTargets.map(parseTargetPattern)
+  const keys = patterns.map(targetPatternKey)
+  if (!unique(keys)) {
+    throw new Error(`${context}: duplicate normalized target pattern.`)
+  }
+  for (let i = 0; i < patterns.length; i++) {
+    for (let j = i + 1; j < patterns.length; j++) {
+      if (patternsOverlap(patterns[i]!, patterns[j]!)) {
+        throw new Error(
+          `${context}: overlapping target patterns ${rawTargets[i]} and ${rawTargets[j]}.`,
+        )
       }
+    }
+  }
+  return { patterns }
+}
 
-      return {
-        id: step.id,
-        matcher: buildTargetMatcher(step.targets.map(parseTargetPattern)),
-        min,
-        max,
+function compileCalls(
+  raw: z.infer<typeof setCallsSchema> | z.infer<typeof sequenceCallsSchema>,
+  policyName: string,
+): CompiledCalls {
+  const rules: CompiledCallRule[] = raw.rules.map((rule) => {
+    const typeArguments = new Map<number, Set<string>>()
+    for (const [indexText, rawTypes] of Object.entries(
+      rule.typeArguments ?? {},
+    )) {
+      const normalized = rawTypes.map((type) => normalizeStructTag(type))
+      if (!unique(normalized)) {
+        throw new Error(
+          `${policyName}.${rule.id}: duplicate normalized type argument.`,
+        )
       }
+      typeArguments.set(Number(indexText), new Set(normalized))
+    }
+
+    const count: CompiledCount | null = rule.count
+      ? 'sameAs' in rule.count
+        ? { kind: 'sameAs', rule: rule.count.sameAs }
+        : { kind: 'range', min: rule.count.min, max: rule.count.max }
+      : null
+
+    return {
+      id: rule.id,
+      matcher: compileTargetList(
+        rule.targets,
+        `${policyName}.calls.rules.${rule.id}`,
+      ),
+      count,
+      typeArguments,
+    }
+  })
+
+  const ruleIds = rules.map((rule) => rule.id)
+  if (!unique(ruleIds)) {
+    throw new Error(`${policyName}: duplicate call rule id.`)
+  }
+  const ruleIdSet = new Set(ruleIds)
+
+  for (let i = 0; i < rules.length; i++) {
+    for (let j = i + 1; j < rules.length; j++) {
+      for (const a of rules[i]!.matcher.patterns) {
+        for (const b of rules[j]!.matcher.patterns) {
+          if (patternsOverlap(a, b)) {
+            throw new Error(
+              `${policyName}: overlapping targets in call rules ${rules[i]!.id} and ${rules[j]!.id}.`,
+            )
+          }
+        }
+      }
+    }
+  }
+
+  for (const rule of rules) {
+    if (rule.count?.kind === 'sameAs' && !ruleIdSet.has(rule.count.rule)) {
+      throw new Error(
+        `${policyName}.${rule.id}.count.sameAs references unknown rule ${rule.count.rule}.`,
+      )
+    }
+  }
+
+  const visitState = new Map<string, 'visiting' | 'done'>()
+  const visit = (ruleId: string): void => {
+    const state = visitState.get(ruleId)
+    if (state === 'visiting') {
+      throw new Error(`${policyName}: circular count.sameAs chain.`)
+    }
+    if (state === 'done') return
+    visitState.set(ruleId, 'visiting')
+    const rule = rules.find((candidate) => candidate.id === ruleId)!
+    if (rule.count?.kind === 'sameAs') visit(rule.count.rule)
+    visitState.set(ruleId, 'done')
+  }
+  for (const rule of rules) visit(rule.id)
+
+  const ordering = raw.mode === 'set' ? (raw.ordering ?? []) : []
+  const orderingKeys = new Set<string>()
+  for (const entry of ordering) {
+    if (!ruleIdSet.has(entry.before) || !ruleIdSet.has(entry.after)) {
+      throw new Error(`${policyName}: ordering references an unknown call rule.`)
+    }
+    if (entry.before === entry.after) {
+      throw new Error(`${policyName}: ordering cannot reference the same rule.`)
+    }
+    const key = `${entry.before}\u0000${entry.after}`
+    if (orderingKeys.has(key)) {
+      throw new Error(`${policyName}: duplicate ordering rule.`)
+    }
+    orderingKeys.add(key)
+  }
+
+  const resultFlow: CompiledResultFlow[] = []
+  const sources = new Set<string>()
+  for (const flow of raw.resultFlow ?? []) {
+    if (!ruleIdSet.has(flow.from.rule)) {
+      throw new Error(`${policyName}: resultFlow source references unknown rule.`)
+    }
+    const source = `${flow.from.rule}\u0000${flow.from.result}`
+    if (sources.has(source)) {
+      throw new Error(`${policyName}: duplicate resultFlow producer clause.`)
+    }
+    sources.add(source)
+
+    const destinations = new Set<string>()
+    for (const destination of flow.to) {
+      if (!ruleIdSet.has(destination.rule)) {
+        throw new Error(
+          `${policyName}: resultFlow destination references unknown rule.`,
+        )
+      }
+      const key = `${destination.rule}\u0000${destination.argument}`
+      if (destinations.has(key)) {
+        throw new Error(`${policyName}: duplicate resultFlow destination.`)
+      }
+      destinations.add(key)
+    }
+    resultFlow.push({
+      from: flow.from,
+      to: destinations,
+      required: flow.required,
     })
   }
 
-  // Result flow rules
-  const resultFlowRules: CompiledResultFlowRule[] = (
-    raw.resultFlow ?? []
-  ).map((rule) => ({
-    fromMatcher: buildTargetMatcher([parseTargetPattern(rule.from)]),
-    toMatcher: buildTargetMatcher(rule.to.map(parseTargetPattern)),
-    required: rule.required,
-  }))
+  return { mode: raw.mode, rules, ordering, resultFlow }
+}
 
-  // Type arguments
-  const typeArguments = new Map<string, Map<number, Set<string>>>()
-  if (raw.typeArguments) {
-    for (const [rawTarget, argConstraints] of Object.entries(
-      raw.typeArguments,
-    )) {
-      const parsed = parseTargetPattern(rawTarget)
-      if (parsed.kind !== 'exact') {
-        throw new Error(
-          `${name}: typeArguments keys must be exact targets, got: ${rawTarget}`,
-        )
-      }
-      if (targetMatcher && !matchTarget(parsed.target, targetMatcher)) {
-        throw new Error(
-          `${name}: typeArguments target not in allowed targets: ${rawTarget}`,
-        )
-      }
+export function loadPolicies(rawConfigs: unknown[]): CompiledPolicies {
+  const parsed = z.array(policySchema).min(1).safeParse(rawConfigs)
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]
+    const path = issue?.path.length ? `${issue.path.join('.')}: ` : ''
+    throw new Error(
+      `Invalid sponsor policies: ${path}${issue?.message ?? 'Invalid policy configuration.'}`,
+    )
+  }
 
-      const argMap = new Map<number, Set<string>>()
-      for (const [indexStr, allowedTypes] of Object.entries(argConstraints)) {
-        const index = Number.parseInt(indexStr, 10)
-        if (Number.isNaN(index) || index < 0) {
-          throw new Error(
-            `${name}: invalid type argument index: ${indexStr}`,
-          )
+  const names = parsed.data.map((policy) => policy.name)
+  if (!unique(names)) throw new Error('Duplicate sponsor policy name.')
+
+  const requirements: CompiledRequirement[] = parsed.data
+    .filter((policy): policy is z.infer<typeof requirePolicySchema> =>
+      policy.type === 'require',
+    )
+    .map((policy) => ({ ...policy, type: 'require' as const }))
+  const requirementsByName = new Map(
+    requirements.map((requirement) => [requirement.name, requirement]),
+  )
+
+  const deny: CompiledDenyPolicy[] = parsed.data
+    .filter((policy): policy is z.infer<typeof denyPolicySchema> =>
+      policy.type === 'deny',
+    )
+    .map((policy) => {
+      let when: CompiledDenyPolicy['when']
+      switch (policy.when.kind) {
+        case 'always':
+          when = { kind: 'always' }
+          break
+        case 'any-move-call':
+          when = {
+            kind: 'any-move-call',
+            matcher: compileTargetList(
+              policy.when.targets,
+              `${policy.name}.when.targets`,
+            ),
+          }
+          break
+        case 'sender':
+          when = {
+            kind: 'sender',
+            addresses: new Set(
+              policy.when.addresses.map((address) => normalizeSuiAddress(address)),
+            ),
+          }
+          break
+      }
+      return { type: 'deny' as const, name: policy.name, enabled: policy.enabled, when }
+    })
+
+  const referencedRequirements = new Set<string>()
+  const allow: CompiledAllowPolicy[] = parsed.data
+    .filter((policy): policy is z.infer<typeof allowPolicySchema> =>
+      policy.type === 'allow',
+    )
+    .map((policy) => {
+      const resolved: CompiledRequirement[] = []
+      if (policy.enabled) {
+        for (const name of policy.requires) {
+          const requirement = requirementsByName.get(name)
+          if (!requirement) {
+            throw new Error(
+              `${policy.name}.requires references unknown requirement ${name}.`,
+            )
+          }
+          if (!requirement.enabled) {
+            throw new Error(
+              `${policy.name}.requires references disabled requirement ${name}.`,
+            )
+          }
+          resolved.push(requirement)
+          referencedRequirements.add(name)
         }
-        argMap.set(
-          index,
-          new Set(allowedTypes.map((type) => normalizeStructTag(type))),
-        )
       }
-      typeArguments.set(parsed.target, argMap)
+
+      return {
+        type: 'allow' as const,
+        name: policy.name,
+        enabled: policy.enabled,
+        requirementNames: policy.requires,
+        requirements: resolved,
+        senders: policy.senders
+          ? new Set(policy.senders.map((address) => normalizeSuiAddress(address)))
+          : null,
+        suinsNamePatterns: policy.suinsNames
+          ? policy.suinsNames.map(parseSuinsNamePattern)
+          : null,
+        gasBudgetMax: policy.gasBudgetMax
+          ? BigInt(policy.gasBudgetMax)
+          : null,
+        allowedCommandKinds: new Set(policy.commands.allowed),
+        maxCommands: policy.commands.max ?? null,
+        calls: compileCalls(policy.calls, policy.name),
+      }
+    })
+
+  for (const requirement of requirements) {
+    if (requirement.enabled && !referencedRequirements.has(requirement.name)) {
+      throw new Error(
+        `Enabled requirement ${requirement.name} is not referenced by an enabled allow policy.`,
+      )
     }
   }
 
   return {
-    name,
-    action,
-    enabled: raw.enabled,
-    senders,
-    suinsNamePatterns,
-    gasBudgetMax:
-      raw.gasBudgetMax !== undefined ? BigInt(raw.gasBudgetMax) : null,
-    allowedCommandKinds: raw.allowedCommandKinds.includes('*') ? null : new Set(raw.allowedCommandKinds),
-    maxCommands: raw.maxCommands ?? null,
-    targetMatcher,
-    callLimits,
-    orderingRules,
-    sequenceSteps,
-    resultFlowRules,
-    typeArguments,
+    require: requirements,
+    deny,
+    allow,
+    requirementsByName,
+    needsSuinsResolution: allow.some(
+      (policy) => policy.enabled && policy.suinsNamePatterns !== null,
+    ),
   }
 }
 
-export const loadPolicies = (rawConfigs: unknown[]): CompiledPolicies => {
-  const parsed = z.array(policySchema).min(1).safeParse(rawConfigs)
-  if (!parsed.success) {
-    const issue =
-      parsed.error.issues[0]?.message ?? 'Invalid policy configuration.'
-    throw new Error(`Invalid sponsor policies: ${issue}`)
-  }
-
-  const seenNames = new Set<string>()
-  const deny: CompiledPolicy[] = []
-  const allow: CompiledPolicy[] = []
-
-  for (const raw of parsed.data) {
-    if (seenNames.has(raw.name)) {
-      throw new Error(`Duplicate sponsor policy name: ${raw.name}`)
-    }
-    seenNames.add(raw.name)
-    const compiled = compilePolicy(raw)
-    if (compiled.action === 'deny') {
-      deny.push(compiled)
-    } else {
-      allow.push(compiled)
-    }
-  }
-
-  const needsSuinsResolution = allow.some((p) => p.suinsNamePatterns !== null)
-
-  return { deny, allow, needsSuinsResolution }
-}
-
-// ─── Validation Helpers ──────────────────────────────────────────────────────
+// ─── Transaction validation ─────────────────────────────────────────────────
 
 type ParsedMoveCall = {
-  index: number
+  commandIndex: number
   target: string
   arguments: unknown[]
   typeArguments: string[]
 }
 
-const getReferencedResultProducerIndex = (argument: unknown): number | null => {
-  if (!argument || typeof argument !== 'object') return null
+type MatchedMoveCall = ParsedMoveCall & { rule: CompiledCallRule }
 
-  const parsed = argument as {
-    $kind?: string
-    Result?: number
-    NestedResult?: [number, number]
+type ResultReference = { producer: number; result: number }
+
+type ResultUse = ResultReference & {
+  consumerCommand: number
+  consumerKind: string
+  consumerRule: string | null
+  argument: number | null
+  topLevelArgument: boolean
+}
+
+function parseResultReference(value: unknown): ResultReference | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null
   }
-
+  const argument = value as {
+    $kind?: unknown
+    Result?: unknown
+    NestedResult?: unknown
+  }
   if (
-    parsed.$kind === 'Result' &&
-    typeof parsed.Result === 'number' &&
-    Number.isInteger(parsed.Result)
+    argument.$kind === 'Result' &&
+    Number.isInteger(argument.Result) &&
+    (argument.Result as number) >= 0
   ) {
-    return parsed.Result
+    return { producer: argument.Result as number, result: 0 }
   }
-
   if (
-    parsed.$kind === 'NestedResult' &&
-    Array.isArray(parsed.NestedResult) &&
-    typeof parsed.NestedResult[0] === 'number' &&
-    Number.isInteger(parsed.NestedResult[0])
+    argument.$kind === 'NestedResult' &&
+    Array.isArray(argument.NestedResult) &&
+    argument.NestedResult.length === 2 &&
+    Number.isInteger(argument.NestedResult[0]) &&
+    Number.isInteger(argument.NestedResult[1]) &&
+    argument.NestedResult[0] >= 0 &&
+    argument.NestedResult[1] >= 0
   ) {
-    return parsed.NestedResult[0]
+    return {
+      producer: argument.NestedResult[0],
+      result: argument.NestedResult[1],
+    }
   }
-
   return null
 }
 
-const referencesGasCoin = (value: unknown): boolean => {
-  if (!value || typeof value !== 'object') return false
+function collectReferences(value: unknown, output: ResultReference[]): void {
+  const direct = parseResultReference(value)
+  if (direct) {
+    output.push(direct)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectReferences(item, output)
+    return
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      collectReferences(child, output)
+    }
+  }
+}
+
+function referencesGasCoin(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false
+  if (Array.isArray(value)) return value.some(referencesGasCoin)
   const record = value as Record<string, unknown>
   if (record.$kind === 'GasCoin' || record.GasCoin === true) return true
   return Object.values(record).some(referencesGasCoin)
 }
 
-const validateConstraintMode = (
-  policy: CompiledPolicy,
-  moveCalls: ParsedMoveCall[],
-): void => {
-  const targetMatcher = policy.targetMatcher!
-
-  // Target matching
-  for (const mc of moveCalls) {
-    if (!matchTarget(mc.target, targetMatcher)) {
-      throw new Error(`move call not allowed: ${mc.target}`)
+function assertRuleTypeArguments(
+  policyName: string,
+  call: ParsedMoveCall,
+  rule: CompiledCallRule,
+): void {
+  for (const [index, allowed] of rule.typeArguments) {
+    const actual = call.typeArguments[index]
+    if (actual === undefined) {
+      throw new Error(
+        `${policyName}.${rule.id}: missing type argument at index ${index}.`,
+      )
     }
-  }
-
-  // Call limits
-  if (policy.callLimits.size > 0) {
-    const targetCounts = new Map<string, number>()
-    for (const mc of moveCalls) {
-      targetCounts.set(mc.target, (targetCounts.get(mc.target) ?? 0) + 1)
-    }
-
-    for (const [target, limit] of policy.callLimits) {
-      const count = targetCounts.get(target) ?? 0
-      if (limit.kind === 'range') {
-        if (limit.min !== undefined && count < limit.min) {
-          throw new Error(
-            `${target} called too few times (min ${limit.min}, found ${count})`,
-          )
-        }
-        if (limit.max !== undefined && count > limit.max) {
-          throw new Error(
-            `${target} called too many times (max ${limit.max}, found ${count})`,
-          )
-        }
-      } else {
-        const refCount = targetCounts.get(limit.target) ?? 0
-        if (count !== refCount) {
-          throw new Error(
-            `${target} count (${count}) must match ${limit.target} count (${refCount})`,
-          )
-        }
-      }
-    }
-  }
-
-  // Ordering
-  for (const rule of policy.orderingRules) {
-    let lastBeforeIndex = -1
-    let firstAfterIndex = Infinity
-
-    for (const mc of moveCalls) {
-      if (matchTarget(mc.target, rule.beforeMatcher)) {
-        lastBeforeIndex = Math.max(lastBeforeIndex, mc.index)
-      }
-      if (matchTarget(mc.target, rule.afterMatcher)) {
-        firstAfterIndex = Math.min(firstAfterIndex, mc.index)
-      }
-    }
-
-    if (
-      lastBeforeIndex !== -1 &&
-      firstAfterIndex !== Infinity &&
-      lastBeforeIndex >= firstAfterIndex
-    ) {
-      throw new Error('ordering constraint violated')
+    if (!allowed.has(actual)) {
+      throw new Error(
+        `${policyName}.${rule.id}: type argument ${index} is not allowed: ${actual}.`,
+      )
     }
   }
 }
 
-const validateSequenceMode = (
-  policy: CompiledPolicy,
-  moveCalls: ParsedMoveCall[],
-): void => {
-  const steps = policy.sequenceSteps!
-  let callIdx = 0
-
-  for (const step of steps) {
-    let matched = 0
-
-    while (
-      callIdx < moveCalls.length &&
-      matchTarget(moveCalls[callIdx]!.target, step.matcher)
-    ) {
-      matched++
-      callIdx++
-      if (matched >= step.max) break
-    }
-
-    if (matched < step.min) {
+function validateCount(
+  policyName: string,
+  rule: CompiledCallRule,
+  count: number,
+  counts: ReadonlyMap<string, number>,
+  mode: 'set' | 'sequence',
+): void {
+  if (rule.count === null) {
+    if (mode === 'sequence' && count !== 1) {
       throw new Error(
-        `sequence step "${step.id}" requires at least ${step.min} calls, found ${matched}`,
+        `${policyName}.${rule.id}: expected exactly 1 call, found ${count}.`,
+      )
+    }
+    return
+  }
+  if (rule.count.kind === 'sameAs') {
+    const expected = counts.get(rule.count.rule) ?? 0
+    if (count !== expected) {
+      throw new Error(
+        `${policyName}.${rule.id}: call count ${count} must equal ${rule.count.rule} count ${expected}.`,
+      )
+    }
+    return
+  }
+  if (rule.count.min !== undefined && count < rule.count.min) {
+    throw new Error(
+      `${policyName}.${rule.id}: expected at least ${rule.count.min} calls, found ${count}.`,
+    )
+  }
+  if (rule.count.max !== undefined && count > rule.count.max) {
+    throw new Error(
+      `${policyName}.${rule.id}: expected at most ${rule.count.max} calls, found ${count}.`,
+    )
+  }
+}
+
+function matchCalls(
+  policy: CompiledAllowPolicy,
+  moveCalls: ParsedMoveCall[],
+): MatchedMoveCall[] {
+  const matched: MatchedMoveCall[] = []
+  const counts = new Map(policy.calls.rules.map((rule) => [rule.id, 0]))
+
+  if (policy.calls.mode === 'set') {
+    for (const call of moveCalls) {
+      const rule = policy.calls.rules.find((candidate) =>
+        matchesTarget(call.target, candidate.matcher),
+      )
+      if (!rule) throw new Error(`move call not allowed: ${call.target}`)
+      assertRuleTypeArguments(policy.name, call, rule)
+      counts.set(rule.id, counts.get(rule.id)! + 1)
+      matched.push({ ...call, rule })
+    }
+  } else {
+    let callIndex = 0
+    for (const rule of policy.calls.rules) {
+      while (
+        callIndex < moveCalls.length &&
+        matchesTarget(moveCalls[callIndex]!.target, rule.matcher)
+      ) {
+        const call = moveCalls[callIndex]!
+        assertRuleTypeArguments(policy.name, call, rule)
+        counts.set(rule.id, counts.get(rule.id)! + 1)
+        matched.push({ ...call, rule })
+        callIndex++
+      }
+    }
+    if (callIndex !== moveCalls.length) {
+      throw new Error(
+        `unexpected or out-of-sequence move call: ${moveCalls[callIndex]!.target}`,
       )
     }
   }
 
-  if (callIdx < moveCalls.length) {
-    throw new Error('unexpected commands after sequence completed')
+  for (const rule of policy.calls.rules) {
+    validateCount(
+      policy.name,
+      rule,
+      counts.get(rule.id)!,
+      counts,
+      policy.calls.mode,
+    )
+  }
+
+  for (const ordering of policy.calls.ordering) {
+    const before = matched
+      .filter((call) => call.rule.id === ordering.before)
+      .map((call) => call.commandIndex)
+    const after = matched
+      .filter((call) => call.rule.id === ordering.after)
+      .map((call) => call.commandIndex)
+    if (
+      before.length > 0 &&
+      after.length > 0 &&
+      Math.max(...before) >= Math.min(...after)
+    ) {
+      throw new Error(
+        `${policy.name}: ordering ${ordering.before} before ${ordering.after} violated.`,
+      )
+    }
+  }
+
+  return matched
+}
+
+function collectResultUses(
+  commands: readonly unknown[],
+  matchedCalls: MatchedMoveCall[],
+): ResultUse[] {
+  const ruleByCommand = new Map(
+    matchedCalls.map((call) => [call.commandIndex, call.rule.id]),
+  )
+  const uses: ResultUse[] = []
+
+  for (const [commandIndex, rawCommand] of commands.entries()) {
+    const command = rawCommand as {
+      $kind?: string
+      MoveCall?: { arguments?: unknown[] }
+    }
+    if (
+      command.$kind === 'MoveCall' &&
+      command.MoveCall &&
+      Array.isArray(command.MoveCall.arguments)
+    ) {
+      for (const [argument, value] of command.MoveCall.arguments.entries()) {
+        const references: ResultReference[] = []
+        collectReferences(value, references)
+        const direct = parseResultReference(value)
+        for (const reference of references) {
+          uses.push({
+            ...reference,
+            consumerCommand: commandIndex,
+            consumerKind: 'MoveCall',
+            consumerRule: ruleByCommand.get(commandIndex) ?? null,
+            argument,
+            topLevelArgument:
+              direct !== null &&
+              direct.producer === reference.producer &&
+              direct.result === reference.result,
+          })
+        }
+      }
+      continue
+    }
+
+    const references: ResultReference[] = []
+    collectReferences(rawCommand, references)
+    for (const reference of references) {
+      uses.push({
+        ...reference,
+        consumerCommand: commandIndex,
+        consumerKind: command.$kind ?? 'Unknown',
+        consumerRule: null,
+        argument: null,
+        topLevelArgument: false,
+      })
+    }
+  }
+
+  return uses
+}
+
+function validateResultFlow(
+  policy: CompiledAllowPolicy,
+  commands: readonly unknown[],
+  matchedCalls: MatchedMoveCall[],
+): void {
+  if (policy.calls.resultFlow.length === 0) return
+  const uses = collectResultUses(commands, matchedCalls)
+
+  for (const flow of policy.calls.resultFlow) {
+    const producers = matchedCalls.filter(
+      (call) => call.rule.id === flow.from.rule,
+    )
+    for (const producer of producers) {
+      const actualUses = uses.filter(
+        (use) =>
+          use.producer === producer.commandIndex &&
+          use.result === flow.from.result,
+      )
+      if (flow.required && actualUses.length === 0) {
+        throw new Error(
+          `${policy.name}.${flow.from.rule}[${flow.from.result}]: result must be consumed.`,
+        )
+      }
+      for (const use of actualUses) {
+        if (
+          use.consumerKind !== 'MoveCall' ||
+          !use.topLevelArgument ||
+          use.consumerRule === null ||
+          use.argument === null
+        ) {
+          throw new Error(
+            `${policy.name}.${flow.from.rule}[${flow.from.result}]: constrained result has a native or non-top-level consumer.`,
+          )
+        }
+        const destination = `${use.consumerRule}\u0000${use.argument}`
+        if (!flow.to.has(destination)) {
+          throw new Error(
+            `${policy.name}.${flow.from.rule}[${flow.from.result}]: result used by disallowed ${use.consumerRule} argument ${use.argument}.`,
+          )
+        }
+      }
+    }
   }
 }
 
-const validateResultFlow = (
-  policy: CompiledPolicy,
+function validateAllowPolicy(
+  policy: CompiledAllowPolicy,
+  commands: readonly unknown[],
   moveCalls: ParsedMoveCall[],
-): void => {
-  if (policy.resultFlowRules.length === 0) return
-
-  const consumersByProducer = new Map<number, string[]>()
-  for (const mc of moveCalls) {
-    for (const arg of mc.arguments) {
-      const producerIndex = getReferencedResultProducerIndex(arg)
-      if (producerIndex === null) continue
-      const existing = consumersByProducer.get(producerIndex)
-      if (existing) {
-        existing.push(mc.target)
-      } else {
-        consumersByProducer.set(producerIndex, [mc.target])
-      }
+): void {
+  if (policy.maxCommands !== null && commands.length > policy.maxCommands) {
+    throw new Error(`too many commands (max ${policy.maxCommands}).`)
+  }
+  for (const rawCommand of commands) {
+    const kind = (rawCommand as { $kind?: string }).$kind
+    if (!kind || !policy.allowedCommandKinds.has(kind as PolicyCommandKind)) {
+      throw new Error(`command kind not allowed: ${kind ?? 'Unknown'}.`)
     }
   }
-
-  for (const rule of policy.resultFlowRules) {
-    for (const producer of moveCalls) {
-      if (!matchTarget(producer.target, rule.fromMatcher)) continue
-
-      const consumers = consumersByProducer.get(producer.index) ?? []
-      if (rule.required && consumers.length === 0) {
-        throw new Error(`result must be consumed: ${producer.target}`)
-      }
-
-      const disallowed = [
-        ...new Set(
-          consumers.filter((c) => !matchTarget(c, rule.toMatcher)),
-        ),
-      ]
-      if (disallowed.length > 0) {
-        throw new Error(
-          `result used by disallowed targets: ${disallowed.join(', ')}`,
-        )
-      }
-    }
+  if (moveCalls.length === 0) {
+    throw new Error('must include at least one MoveCall.')
   }
+  const matched = matchCalls(policy, moveCalls)
+  validateResultFlow(policy, commands, matched)
 }
 
-const validateTypeArguments = (
-  policy: CompiledPolicy,
-  moveCalls: ParsedMoveCall[],
-): void => {
-  if (policy.typeArguments.size === 0) return
-
-  for (const mc of moveCalls) {
-    const constraints = policy.typeArguments.get(mc.target)
-    if (!constraints) continue
-
-    for (const [argIndex, allowedTypes] of constraints) {
-      const actual = mc.typeArguments[argIndex]
-      if (actual === undefined) {
-        throw new Error(
-          `${mc.target}: missing type argument at index ${argIndex}`,
-        )
-      }
-      if (!allowedTypes.has(actual)) {
-        throw new Error(
-          `${mc.target}: type argument ${argIndex} not allowed: ${actual}`,
-        )
-      }
-    }
-  }
+export type PolicyAllowBranch = {
+  policyName: string
+  requirements: CompiledRequirement[]
 }
 
-// ─── Main Validation ─────────────────────────────────────────────────────────
+export type PolicyEvaluationPlan = {
+  calledTargets: string[]
+  ownedInputIds: string[]
+  allowBranches: PolicyAllowBranch[]
+}
 
-export const validateSponsoredTxPayload = ({
+export function validateSponsoredTxPayload({
   txBytesBase64,
   expectedSender,
   expectedSponsor,
@@ -833,7 +1067,7 @@ export const validateSponsoredTxPayload = ({
   expectedSponsor: string
   policies: CompiledPolicies
   senderName?: string | null
-}) => {
+}): PolicyEvaluationPlan {
   const tx = Transaction.from(txBytesBase64)
   const txData = tx.getData()
 
@@ -845,13 +1079,12 @@ export const validateSponsoredTxPayload = ({
   ) {
     throw new Error('Transaction sender does not match payload sender.')
   }
-
   if (!txData.gasData.owner) {
     throw new Error('Sponsored transaction is missing its gas owner.')
   }
   if (
     normalizeSuiAddress(txData.gasData.owner) !==
-      normalizeSuiAddress(expectedSponsor)
+    normalizeSuiAddress(expectedSponsor)
   ) {
     throw new Error(
       'Transaction gas owner does not match configured sponsor.',
@@ -862,9 +1095,7 @@ export const validateSponsoredTxPayload = ({
   for (const input of txData.inputs) {
     if (input.$kind === 'FundsWithdrawal') {
       if (input.FundsWithdrawal.withdrawFrom.$kind !== 'Sender') {
-        throw new Error(
-          'Sponsored transactions may only withdraw sender funds.',
-        )
+        throw new Error('Sponsored transactions may only withdraw sender funds.')
       }
       continue
     }
@@ -882,125 +1113,129 @@ export const validateSponsoredTxPayload = ({
     throw new Error('Sponsored transaction commands may not use GasCoin.')
   }
 
-  // Extract move calls once for both deny and allow phases
   const moveCalls: ParsedMoveCall[] = []
-  for (const [index, command] of txData.commands.entries()) {
-    if (command.$kind === 'MoveCall' && command.MoveCall) {
-      const mc = command.MoveCall
-      moveCalls.push({
-        index,
-        target: getMoveCallTarget({
-          packageId: mc.package,
-          module: mc.module,
-          functionName: mc.function,
-        }),
-        arguments: mc.arguments,
-        typeArguments: mc.typeArguments.map((type) =>
-          normalizeStructTag(type),
-        ),
-      })
-    }
+  for (const [commandIndex, command] of txData.commands.entries()) {
+    if (command.$kind !== 'MoveCall' || !command.MoveCall) continue
+    moveCalls.push({
+      commandIndex,
+      target: getMoveCallTarget(command.MoveCall),
+      arguments: command.MoveCall.arguments,
+      typeArguments: command.MoveCall.typeArguments.map((type) =>
+        normalizeStructTag(type),
+      ),
+    })
   }
+  const calledTargets = moveCalls.map((call) => call.target)
+  const normalizedSender = normalizeSuiAddress(expectedSender)
 
-  const normalizedExpectedSender = normalizeSuiAddress(expectedSender)
-
-  // Phase 1: Deny policies (any-match — reject if ANY call hits a denied target)
   for (const policy of policies.deny) {
     if (!policy.enabled) continue
-    if (!passesSenderGate(policy.senders, normalizedExpectedSender)) continue
+    let denied = false
+    switch (policy.when.kind) {
+      case 'always':
+        denied = true
+        break
+      case 'sender':
+        denied = policy.when.addresses.has(normalizedSender)
+        break
+      case 'any-move-call':
+        const matcher = policy.when.matcher
+        denied = moveCalls.some((call) =>
+          matchesTarget(call.target, matcher),
+        )
+        break
+    }
+    if (denied) throw new Error(`Transaction denied by policy: ${policy.name}.`)
+  }
 
-    // No targets = deny all (scoped by sender if specified)
-    if (!policy.targetMatcher) {
-      throw new Error(`Transaction denied by policy: ${policy.name}`)
+  const errors: string[] = []
+  const allowBranches: PolicyAllowBranch[] = []
+  for (const policy of policies.allow) {
+    if (!policy.enabled) continue
+    if (policy.senders && !policy.senders.has(normalizedSender)) continue
+    if (
+      policy.suinsNamePatterns &&
+      !matchSuinsName(senderName ?? null, policy.suinsNamePatterns)
+    ) {
+      continue
+    }
+    if (policy.gasBudgetMax !== null) {
+      if (
+        txData.gasData.budget == null ||
+        BigInt(txData.gasData.budget) > policy.gasBudgetMax
+      ) {
+        continue
+      }
     }
 
-    // Any-match: deny if ANY move call matches a denied target
-    const deniedCall = moveCalls.find((mc) =>
-      matchTarget(mc.target, policy.targetMatcher!),
-    )
-    if (deniedCall) {
-      throw new Error(
-        `Transaction denied by policy: ${policy.name} (matched ${deniedCall.target})`,
+    try {
+      validateAllowPolicy(policy, txData.commands, moveCalls)
+      allowBranches.push({
+        policyName: policy.name,
+        requirements: policy.requirements,
+      })
+    } catch (error) {
+      errors.push(
+        `${policy.name}: ${error instanceof Error ? error.message : 'unknown error'}`,
       )
     }
   }
 
-  // Phase 2: Allow policies (first-match-wins, all calls must match)
-  const policyErrors: string[] = []
-
-  for (const policy of policies.allow) {
-    if (!policy.enabled) continue
-    if (!passesSenderGate(policy.senders, normalizedExpectedSender)) continue
-    if (
-      policy.suinsNamePatterns &&
-      !matchSuinsName(senderName ?? null, policy.suinsNamePatterns)
+  if (allowBranches.length === 0) {
+    throw new Error(
+      `Transaction did not match any allow policy.${errors.length ? ` ${errors.join(' | ')}` : ''}`,
     )
-      continue
-    if (policy.gasBudgetMax !== null && txData.gasData.budget) {
-      if (BigInt(txData.gasData.budget) > policy.gasBudgetMax) continue
-    }
-
-    try {
-      // maxCommands
-      if (
-        policy.maxCommands !== null &&
-        txData.commands.length > policy.maxCommands
-      ) {
-        throw new Error(`too many commands (max ${policy.maxCommands})`)
-      }
-
-      // allowedCommandKinds (null = all allowed)
-      if (policy.allowedCommandKinds !== null) {
-        for (const command of txData.commands) {
-          if (!policy.allowedCommandKinds.has(command.$kind)) {
-            throw new Error(`command kind not allowed: ${command.$kind}`)
-          }
-        }
-      }
-
-      if (
-        moveCalls.length === 0 &&
-        (policy.targetMatcher || policy.sequenceSteps)
-      ) {
-        throw new Error('must include at least one MoveCall')
-      }
-
-      // Constraint mode or Sequence mode
-      if (policy.targetMatcher) {
-        validateConstraintMode(policy, moveCalls)
-      } else if (policy.sequenceSteps) {
-        validateSequenceMode(policy, moveCalls)
-      }
-
-      // Type arguments
-      validateTypeArguments(policy, moveCalls)
-
-      // Result flow
-      validateResultFlow(policy, moveCalls)
-
-      // If the policy has a dynamic sender check, it only needs to run when
-      // the sender isn't already covered by the static list — a static hit
-      // is a free allow, no HTTP call required.
-      let dynamicSenders: DynamicSendersConfig | null = null
-      if (policy.senders?.dynamic) {
-        const inStatic =
-          policy.senders.static?.has(normalizedExpectedSender) ?? false
-        if (!inStatic) dynamicSenders = policy.senders.dynamic
-      }
-
-      return {
-        calledTargets: moveCalls.map((mc) => mc.target),
-        matchedPolicyName: policy.name,
-        ownedInputIds: [...new Set(ownedInputIds)],
-        dynamicSenders,
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'unknown error'
-      policyErrors.push(`${policy.name}: ${message}`)
-    }
   }
 
-  throw new Error(
-    `Transaction did not match any sponsor policy. ${policyErrors.join(' | ')}`,
-  )
+  return {
+    calledTargets,
+    ownedInputIds: [...new Set(ownedInputIds)],
+    allowBranches,
+  }
+}
+
+// ─── Requirement algebra ────────────────────────────────────────────────────
+
+export type RequirementDecision = 'allow' | 'deny' | 'unavailable'
+
+export type AuthorizationDecision =
+  | { status: 'allowed'; policyName: string }
+  | { status: 'denied' }
+  | { status: 'unavailable' }
+
+export async function evaluatePolicyRequirements({
+  allowBranches,
+  evaluate,
+}: {
+  allowBranches: readonly PolicyAllowBranch[]
+  evaluate: (input: {
+    requirement: CompiledRequirement
+    policyName: string
+  }) => Promise<RequirementDecision>
+}): Promise<AuthorizationDecision> {
+  let sawUnavailable = false
+
+  for (const branch of allowBranches) {
+    let branchUnavailable = false
+    let branchDenied = false
+
+    for (const requirement of branch.requirements) {
+      const decision = await evaluate({
+        requirement,
+        policyName: branch.policyName,
+      })
+      if (decision === 'deny') {
+        branchDenied = true
+        break
+      }
+      if (decision === 'unavailable') branchUnavailable = true
+    }
+
+    if (!branchDenied && !branchUnavailable) {
+      return { status: 'allowed', policyName: branch.policyName }
+    }
+    if (!branchDenied && branchUnavailable) sawUnavailable = true
+  }
+
+  return sawUnavailable ? { status: 'unavailable' } : { status: 'denied' }
 }

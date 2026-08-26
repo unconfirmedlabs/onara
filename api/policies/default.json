@@ -1,26 +1,28 @@
 {
+  "type": "allow",
   "name": "default-coin-zero-flow",
-  "maxCommands": 2,
-  "targets": [
-    "0x0000000000000000000000000000000000000000000000000000000000000002::coin::zero",
-    "0x0000000000000000000000000000000000000000000000000000000000000002::coin::destroy_zero"
-  ],
-  "callLimits": {
-    "0x0000000000000000000000000000000000000000000000000000000000000002::coin::zero": {
-      "min": 1,
-      "max": 1
-    },
-    "0x0000000000000000000000000000000000000000000000000000000000000002::coin::destroy_zero": {
-      "max": 1
-    }
+  "requires": [],
+  "commands": {
+    "allowed": ["MoveCall"],
+    "max": 2
   },
-  "resultFlow": [
-    {
-      "from": "0x0000000000000000000000000000000000000000000000000000000000000002::coin::zero",
-      "to": [
-        "0x0000000000000000000000000000000000000000000000000000000000000002::coin::destroy_zero"
-      ],
-      "required": true
-    }
-  ]
+  "calls": {
+    "mode": "sequence",
+    "rules": [
+      {
+        "id": "zero",
+        "targets": ["0x2::coin::zero"]
+      },
+      {
+        "id": "destroy-zero",
+        "targets": ["0x2::coin::destroy_zero"]
+      }
+    ],
+    "resultFlow": [
+      {
+        "from": { "rule": "zero", "result": 0 },
+        "to": [{ "rule": "destroy-zero", "argument": 0 }]
+      }
+    ]
+  }
 }
