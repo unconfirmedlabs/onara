@@ -41,7 +41,7 @@ bun run deploy
 | `ANALYTICS` | Analytics Engine | Optional. When bound, writes sponsorship analytics per request. |
 | `SENDER_RATE_LIMIT` | Rate Limiting | Optional. When bound, caps requests per sender address. Absent = no per-sender limit. |
 | `IP_RATE_LIMIT` | Rate Limiting | Optional. When bound, caps requests per `cf-connecting-ip`. Absent = no per-IP limit. |
-| `DYNAMIC_SENDERS_CACHE` | KV Namespace | Optional. Caches allow decisions from `sender.dynamic` requirement checks that set `cacheTtlSeconds > 0`. Absent = requirement checks are never cached. |
+| `DYNAMIC_AUTHORIZATION_CACHE` | KV Namespace | Optional. Caches allow decisions from `dynamic-authorization` requirement checks that set `cacheTtlSeconds > 0`. Absent = requirement checks are never cached. |
 
 To enable analytics, add the binding in `wrangler.jsonc`:
 
@@ -114,7 +114,7 @@ policy array:
       "type": "require",
       "name": "example-sender",
       "check": {
-        "kind": "sender.dynamic",
+        "kind": "dynamic-authorization",
         "url": "https://api.example.com/v1/onara/authorize",
         "audience": "example-onara-authorization",
         "signingKeyEnv": "EXAMPLE_ONARA_SIGNING_KEY",
@@ -161,7 +161,7 @@ Wrangler. It generates temporary Wrangler/policy files and restores/removes
 them on every exit. The older `<config>/wrangler.jsonc` plus
 `<config>/policies/*.json` layout remains supported for migration, but new
 deployments should use unified `config.json`.
-For each dynamic sender signing key found in a local `.env`, deploy preflight
+For each dynamic authorization signing key found in a local `.env`, deploy preflight
 also parses the Bech32 key, derives its address, and requires it to equal the
 policy's `signingIdentity`; logs contain only the scheme/address. Cloudflare
 does not expose existing remote secret values, so a missing local value warns.
@@ -321,7 +321,7 @@ separate from command inputs and may be sponsor-owned.
 Every entry has an explicit `type` and a unique `name`:
 
 - **`require`** defines a reusable external check. Schema v1 supports
-  `sender.dynamic`.
+  `dynamic-authorization`.
 - **`deny`** rejects on `always`, `sender`, or `any-move-call`.
 - **`allow`** defines one concrete structural branch and its mandatory
   `requires` array.
@@ -347,7 +347,7 @@ clauses are rejected at load time.
   "name": "trusted-sender",
   "enabled": true,
   "check": {
-    "kind": "sender.dynamic",
+    "kind": "dynamic-authorization",
     "url": "https://issuer.example.com/onara/authorize",
     "audience": "issuer-onara-authorization",
     "signingKeyEnv": "ISSUER_ONARA_SIGNING_KEY",
@@ -457,7 +457,7 @@ must be one of the declared Move-call top-level arguments. Native consumers
 nested uses are rejected. Duplicate producer clauses and duplicate destinations
 are configuration errors.
 
-### Sender gates and dynamic requirements
+### Sender gates and dynamic authorization
 
 An allow branch may use `"senders": ["0xALICE", "0xBOB"]` as a synchronous
 static selector. If the sender does not match, that branch is skipped while
@@ -465,7 +465,7 @@ other structural branches remain eligible. A deny-by-sender rule instead uses
 `{ "kind": "sender", "addresses": [...] }`.
 
 External authorization is a named `require` policy with
-`check.kind: "sender.dynamic"`. Every enabled allow branch lists its named
+`check.kind: "dynamic-authorization"`. Every enabled allow branch lists its named
 requirements in the mandatory `requires` array. Requirements are ANDed within
 one branch; structurally complete allow branches are ORed. The server signs and
 caches the exact `(requirement name, concrete allow policy name)` tuple, so an
@@ -501,7 +501,7 @@ The signed personal-message bytes are the UTF-8 encoding of the following
 canonical payload, in this exact field order, with no trailing newline:
 
 ```text
-onara.dynamic-senders.v1
+onara.dynamic-authorization.v1
 audience:<audience>
 sender:<normalized-0x-plus-64-lowercase-hex>
 requirement:<named-requirement>
@@ -545,14 +545,14 @@ material and must never be used in production:
 scheme: ED25519
 private key: suiprivkey1qqqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszasa5uj
 identity: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f
-signature: ANL2jUvYl/SrberxO5hOgmIAPfYw9e0K9Y/jI8d1fe/cTvTrH44saeRNJIlmz/O6ForPLZGeZWKobzXR/WDznwaKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA==
+signature: ALnEwszsGcoTR/PnAU4Aa6auMFYH+/wiy+9z9DCmSoyd9qQGRNHD7OvaEs3sGbS5Dp3ohesqQv2oT2dRYTqnygaKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA==
 ```
 
 The signature is over this exact personal-message payload (again, no final
 newline):
 
 ```text
-onara.dynamic-senders.v1
+onara.dynamic-authorization.v1
 audience:miso-onara-authorization
 sender:0x0000000000000000000000000000000000000000000000000000000000000001
 requirement:miso-enoki-sender
@@ -589,10 +589,10 @@ app.get('/onara/authorize', async (c) => {
   }
 
   // These trust values come from receiver config, not request headers.
-  const ok = await verifyDynamicSenderAuthorization({
+  const ok = await verifyDynamicAuthorizationRequest({
     ...request,
     requestMethod: c.req.method,
-    expectedAudience: c.env.ONARA_DYNAMIC_AUDIENCE,
+    expectedAudience: c.env.ONARA_AUTHORIZATION_AUDIENCE,
     expectedNetwork: c.env.SUI_NETWORK,
     allowedRequirementPolicies: {
       [c.env.ONARA_REQUIREMENT]: c.env.ONARA_ALLOWED_POLICIES.split(','),
@@ -616,7 +616,7 @@ and any allow-cache TTL have elapsed. Multiple requirements in the same delibera
 trust domain may explicitly reuse a key, but separate operators/endpoints
 should use separate key envs and audiences.
 
-Bind a KV namespace as `DYNAMIC_SENDERS_CACHE` if any requirement sets
+Bind a KV namespace as `DYNAMIC_AUTHORIZATION_CACHE` if any requirement sets
 `cacheTtlSeconds > 0` — see `wrangler.example.jsonc`.
 
 **Migration from HMAC.** The old `secretEnv` field and implicit
@@ -967,9 +967,9 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 - SuiNS name matching (wildcard, exact, DNS RFC 4592, case insensitivity, soft-skip)
 - Soft skip behavior (disabled, sender restriction, SuiNS name, gas budget fallthrough)
 - OR/AND/tri-state requirement algebra and overlapping structural branches
-- Dynamic sender requirements — exact requirement/policy tuple signing,
+- Dynamic authorization requirements — exact requirement/policy tuple signing,
   tamper/cross-domain/replay-window cases, trust pinning, key rotation, response
-  mapping, caching, and redirects (`src/dynamic-senders.test.ts`)
+  mapping, caching, and redirects (`src/dynamic-authorization.test.ts`)
 - Integration test against the real `policies/default.json`
 
 ## Project structure
@@ -983,8 +983,8 @@ src/
   input-authorization.test.ts  Owned-input authorization tests
   request-guards.ts            Gas budget cap + rate limit helpers (HTTP + WS)
   request-guards.test.ts       Request guard tests
-  dynamic-senders.ts           Dynamic sender whitelist HTTP check (Sui request signing, verification reference, caching)
-  dynamic-senders.test.ts      Dynamic sender whitelist tests
+  dynamic-authorization.ts       Dynamic authorization HTTP check, request signing, verification, and caching
+  dynamic-authorization.test.ts  Dynamic authorization protocol and behavior tests
   workers.ts      Cloudflare Workers entrypoint
 policies/
   index.ts        Policy registry

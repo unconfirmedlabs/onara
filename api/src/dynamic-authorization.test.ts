@@ -4,18 +4,18 @@ import { Secp256k1Keypair } from '@mysten/sui/keypairs/secp256k1'
 import { Secp256r1Keypair } from '@mysten/sui/keypairs/secp256r1'
 import { normalizeSuiAddress } from '@mysten/sui/utils'
 import {
-  buildDynamicSenderAuthorizationMessage,
-  checkDynamicSender,
-  DynamicSenderDeniedError,
-  DynamicSenderUnavailableError,
-  parseDynamicSenderSigningKey,
-  signDynamicSenderAuthorization,
-  verifyDynamicSenderAuthorization,
-  type DynamicSenderAuthorizationFields,
-  type DynamicSendersCache,
-  type SignedDynamicSenderAuthorization,
-} from './dynamic-senders'
-import type { DynamicSenderCheck } from './policy'
+  buildDynamicAuthorizationRequestMessage,
+  checkDynamicAuthorization,
+  DynamicAuthorizationDeniedError,
+  DynamicAuthorizationUnavailableError,
+  parseDynamicAuthorizationSigningKey,
+  signDynamicAuthorizationRequest,
+  verifyDynamicAuthorizationRequest,
+  type DynamicAuthorizationRequestFields,
+  type DynamicAuthorizationCache,
+  type SignedDynamicAuthorizationRequest,
+} from './dynamic-authorization'
+import type { DynamicAuthorizationCheck } from './policy'
 
 const SENDER = normalizeSuiAddress('0x1')
 const OTHER_SENDER = normalizeSuiAddress('0x99')
@@ -46,7 +46,7 @@ function expectedCacheKey({
   signingIdentity?: string
 } = {}): string {
   return [
-    'dynsender',
+    'dynamic-authorization',
     'v1',
     audience,
     url,
@@ -71,8 +71,8 @@ const ATTACKER_KEYPAIR = Ed25519Keypair.fromSecretKey(
 )
 
 function fields(
-  overrides: Partial<DynamicSenderAuthorizationFields> = {},
-): DynamicSenderAuthorizationFields {
+  overrides: Partial<DynamicAuthorizationRequestFields> = {},
+): DynamicAuthorizationRequestFields {
   return {
     audience: AUDIENCE,
     sender: SENDER,
@@ -86,10 +86,10 @@ function fields(
 }
 
 function config(
-  overrides: Partial<DynamicSenderCheck> = {},
-): DynamicSenderCheck {
+  overrides: Partial<DynamicAuthorizationCheck> = {},
+): DynamicAuthorizationCheck {
   return {
-    kind: 'sender.dynamic',
+    kind: 'dynamic-authorization',
     url: URL,
     audience: AUDIENCE,
     signingKeyEnv: 'MISO_ONARA_SIGNING_KEY',
@@ -107,7 +107,9 @@ function env(
   return key === null ? {} : { [name]: key }
 }
 
-function memoryCache(): DynamicSendersCache & { store: Map<string, string> } {
+function memoryCache(): DynamicAuthorizationCache & {
+  store: Map<string, string>
+} {
   const store = new Map<string, string>()
   return {
     store,
@@ -121,11 +123,11 @@ function memoryCache(): DynamicSendersCache & { store: Map<string, string> } {
 }
 
 function verifierInput(
-  signed: SignedDynamicSenderAuthorization,
+  signed: SignedDynamicAuthorizationRequest,
   overrides: Partial<
-    Parameters<typeof verifyDynamicSenderAuthorization>[0]
+    Parameters<typeof verifyDynamicAuthorizationRequest>[0]
   > = {},
-): Parameters<typeof verifyDynamicSenderAuthorization>[0] {
+): Parameters<typeof verifyDynamicAuthorizationRequest>[0] {
   return {
     ...signed,
     requestMethod: 'GET',
@@ -141,10 +143,10 @@ function verifierInput(
 describe('canonical Sui personal-message protocol', () => {
   test('matches the deterministic Miso interoperability vector exactly', async () => {
     const message = new TextDecoder().decode(
-      buildDynamicSenderAuthorizationMessage(fields()),
+      buildDynamicAuthorizationRequestMessage(fields()),
     )
     expect(message).toBe(
-      'onara.dynamic-senders.v1\n' +
+      'onara.dynamic-authorization.v1\n' +
         'audience:miso-onara-authorization\n' +
         `sender:${SENDER}\n` +
         'requirement:miso-enoki-sender\n' +
@@ -163,15 +165,15 @@ describe('canonical Sui personal-message protocol', () => {
       '0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f',
     )
 
-    const signed = await signDynamicSenderAuthorization({
+    const signed = await signDynamicAuthorizationRequest({
       signingKey: KEYPAIR,
       ...fields(),
     })
     expect(signed.signature).toBe(
-      'ANL2jUvYl/SrberxO5hOgmIAPfYw9e0K9Y/jI8d1fe/cTvTrH44saeRNJIlmz/O6ForPLZGeZWKobzXR/WDznwaKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA==',
+      'ALnEwszsGcoTR/PnAU4Aa6auMFYH+/wiy+9z9DCmSoyd9qQGRNHD7OvaEs3sGbS5Dp3ohesqQv2oT2dRYTqnygaKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA==',
     )
     await expect(
-      verifyDynamicSenderAuthorization(verifierInput(signed)),
+      verifyDynamicAuthorizationRequest(verifierInput(signed)),
     ).resolves.toBe(true)
   })
 
@@ -182,44 +184,44 @@ describe('canonical Sui personal-message protocol', () => {
       Secp256r1Keypair.fromSecretKey(new Uint8Array(32).fill(4)),
     ]
     for (const keypair of keypairs) {
-      const parsed = parseDynamicSenderSigningKey(keypair.getSecretKey())
+      const parsed = parseDynamicAuthorizationSigningKey(keypair.getSecretKey())
       expect(parsed.getKeyScheme()).toBe(keypair.getKeyScheme())
       expect(parsed.toSuiAddress()).toBe(keypair.toSuiAddress())
     }
   })
 
   test('rejects malformed keys, fields, and ambiguous line values', () => {
-    expect(() => parseDynamicSenderSigningKey('not-a-key')).toThrow()
+    expect(() => parseDynamicAuthorizationSigningKey('not-a-key')).toThrow()
     expect(() =>
-      buildDynamicSenderAuthorizationMessage(fields({ audience: 'miso\nevil' })),
+      buildDynamicAuthorizationRequestMessage(fields({ audience: 'miso\nevil' })),
     ).toThrow(/visible ASCII/)
     expect(() =>
-      buildDynamicSenderAuthorizationMessage(
+      buildDynamicAuthorizationRequestMessage(
         fields({ requirementName: 'requirement\nevil' }),
       ),
     ).toThrow(/visible ASCII/)
     expect(() =>
-      buildDynamicSenderAuthorizationMessage(fields({ policyName: 'p\r\nevil' })),
+      buildDynamicAuthorizationRequestMessage(fields({ policyName: 'p\r\nevil' })),
     ).toThrow(/visible ASCII/)
     expect(() =>
-      buildDynamicSenderAuthorizationMessage(fields({ network: ' testnet' })),
+      buildDynamicAuthorizationRequestMessage(fields({ network: ' testnet' })),
     ).toThrow(/visible ASCII/)
     expect(() =>
-      buildDynamicSenderAuthorizationMessage(fields({ requestId: 'NOT-A-UUID' })),
+      buildDynamicAuthorizationRequestMessage(fields({ requestId: 'NOT-A-UUID' })),
     ).toThrow(/UUID v4/)
     expect(() =>
-      buildDynamicSenderAuthorizationMessage(fields({ timestamp: Number.NaN })),
+      buildDynamicAuthorizationRequestMessage(fields({ timestamp: Number.NaN })),
     ).toThrow(/timestamp/)
   })
 })
 
 describe('receiver reference verifier adversarial cases', () => {
   test('rejects tampering of every signed field and the claimed identity', async () => {
-    const signed = await signDynamicSenderAuthorization({
+    const signed = await signDynamicAuthorizationRequest({
       signingKey: KEYPAIR,
       ...fields(),
     })
-    const tampered: Array<Partial<SignedDynamicSenderAuthorization>> = [
+    const tampered: Array<Partial<SignedDynamicAuthorizationRequest>> = [
       { audience: 'other-audience' },
       { sender: OTHER_SENDER },
       { requirementName: 'other-requirement' },
@@ -233,7 +235,7 @@ describe('receiver reference verifier adversarial cases', () => {
 
     for (const mutation of tampered) {
       await expect(
-        verifyDynamicSenderAuthorization(
+        verifyDynamicAuthorizationRequest(
           verifierInput({ ...signed, ...mutation }),
         ),
       ).resolves.toBe(false)
@@ -241,12 +243,12 @@ describe('receiver reference verifier adversarial cases', () => {
   })
 
   test('rejects cross-audience, cross-requirement, cross-policy, cross-network, and cross-method replay', async () => {
-    const signed = await signDynamicSenderAuthorization({
+    const signed = await signDynamicAuthorizationRequest({
       signingKey: KEYPAIR,
       ...fields(),
     })
     const receiverMutations: Array<
-      Partial<Parameters<typeof verifyDynamicSenderAuthorization>[0]>
+      Partial<Parameters<typeof verifyDynamicAuthorizationRequest>[0]>
     > = [
       { expectedAudience: 'another-trust-domain' },
       { allowedRequirementPolicies: { 'another-requirement': [POLICY] } },
@@ -256,48 +258,48 @@ describe('receiver reference verifier adversarial cases', () => {
     ]
     for (const mutation of receiverMutations) {
       await expect(
-        verifyDynamicSenderAuthorization(verifierInput(signed, mutation)),
+        verifyDynamicAuthorizationRequest(verifierInput(signed, mutation)),
       ).resolves.toBe(false)
     }
   })
 
   test('rejects stale and future timestamps outside the freshness window', async () => {
     for (const timestamp of [1_700_000_000 - 301, 1_700_000_000 + 301]) {
-      const signed = await signDynamicSenderAuthorization({
+      const signed = await signDynamicAuthorizationRequest({
         signingKey: KEYPAIR,
         ...fields({ timestamp }),
       })
       await expect(
-        verifyDynamicSenderAuthorization(verifierInput(signed)),
+        verifyDynamicAuthorizationRequest(verifierInput(signed)),
       ).resolves.toBe(false)
     }
   })
 
   test('rejects an attacker-selected identity even with a valid attacker signature', async () => {
-    const attackerSigned = await signDynamicSenderAuthorization({
+    const attackerSigned = await signDynamicAuthorizationRequest({
       signingKey: ATTACKER_KEYPAIR,
       ...fields(),
     })
     await expect(
-      verifyDynamicSenderAuthorization(verifierInput(attackerSigned)),
+      verifyDynamicAuthorizationRequest(verifierInput(attackerSigned)),
     ).resolves.toBe(false)
 
     // Merely relabeling the attacker's valid signature with a trusted identity
     // also fails because the recovered signer must equal the header.
     await expect(
-      verifyDynamicSenderAuthorization(
+      verifyDynamicAuthorizationRequest(
         verifierInput({ ...attackerSigned, identity: IDENTITY }),
       ),
     ).resolves.toBe(false)
   })
 
   test('accepts either independently trusted identity during rotation', async () => {
-    const nextSigned = await signDynamicSenderAuthorization({
+    const nextSigned = await signDynamicAuthorizationRequest({
       signingKey: ATTACKER_KEYPAIR,
       ...fields(),
     })
     await expect(
-      verifyDynamicSenderAuthorization(
+      verifyDynamicAuthorizationRequest(
         verifierInput(nextSigned, {
           trustedIdentities: [IDENTITY, ATTACKER_KEYPAIR.toSuiAddress()],
         }),
@@ -306,24 +308,24 @@ describe('receiver reference verifier adversarial cases', () => {
   })
 
   test('requires canonical sender and identity header encodings', async () => {
-    const signed = await signDynamicSenderAuthorization({
+    const signed = await signDynamicAuthorizationRequest({
       signingKey: KEYPAIR,
       ...fields(),
     })
     await expect(
-      verifyDynamicSenderAuthorization(
+      verifyDynamicAuthorizationRequest(
         verifierInput({ ...signed, sender: '0x1' }),
       ),
     ).resolves.toBe(false)
     await expect(
-      verifyDynamicSenderAuthorization(
+      verifyDynamicAuthorizationRequest(
         verifierInput({ ...signed, identity: IDENTITY.toUpperCase() }),
       ),
     ).resolves.toBe(false)
   })
 })
 
-describe('checkDynamicSender', () => {
+describe('checkDynamicAuthorization', () => {
   const baseArgs = () => ({
     check: config(),
     requirementName: REQUIREMENT,
@@ -340,15 +342,15 @@ describe('checkDynamicSender', () => {
       (async () => new Response(null, { status })) as unknown as typeof fetch
 
     await expect(
-      checkDynamicSender({ ...baseArgs(), fetchImpl: response(204) }),
+      checkDynamicAuthorization({ ...baseArgs(), fetchImpl: response(204) }),
     ).resolves.toBeUndefined()
     await expect(
-      checkDynamicSender({ ...baseArgs(), fetchImpl: response(403) }),
-    ).rejects.toBeInstanceOf(DynamicSenderDeniedError)
+      checkDynamicAuthorization({ ...baseArgs(), fetchImpl: response(403) }),
+    ).rejects.toBeInstanceOf(DynamicAuthorizationDeniedError)
     for (const status of [200, 302, 400, 404, 429, 500]) {
       await expect(
-        checkDynamicSender({ ...baseArgs(), fetchImpl: response(status) }),
-      ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+        checkDynamicAuthorization({ ...baseArgs(), fetchImpl: response(status) }),
+      ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     }
   })
 
@@ -361,7 +363,7 @@ describe('checkDynamicSender', () => {
       return new Response(null, { status: 204 })
     }) as unknown as typeof fetch
 
-    await checkDynamicSender({ ...baseArgs(), fetchImpl })
+    await checkDynamicAuthorization({ ...baseArgs(), fetchImpl })
     expect(request?.method).toBe('GET')
     expect(redirect).toBe('manual')
     expect(request?.headers.get('X-Onara-Audience')).toBe(AUDIENCE)
@@ -373,7 +375,7 @@ describe('checkDynamicSender', () => {
     expect(request?.headers.get('X-Onara-Request-Id')).toBe(REQUEST_ID)
     expect(request?.headers.get('X-Onara-Identity')).toBe(IDENTITY)
     expect(request?.headers.get('X-Onara-Signature')).toBe(
-      'ANL2jUvYl/SrberxO5hOgmIAPfYw9e0K9Y/jI8d1fe/cTvTrH44saeRNJIlmz/O6ForPLZGeZWKobzXR/WDznwaKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA==',
+      'ALnEwszsGcoTR/PnAU4Aa6auMFYH+/wiy+9z9DCmSoyd9qQGRNHD7OvaEs3sGbS5Dp3ohesqQv2oT2dRYTqnygaKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA==',
     )
     expect(request?.headers.get('User-Agent')).toBe('onara')
   })
@@ -402,14 +404,14 @@ describe('checkDynamicSender', () => {
 
     try {
       await expect(
-        checkDynamicSender({
+        checkDynamicAuthorization({
           ...baseArgs(),
           check: config({
             url: new globalThis.URL('/authorize', server.url).toString(),
           }),
           fetchImpl: fetch,
         }),
-      ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+      ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
       expect(authorizationCalls).toBe(1)
       expect(targetCalls).toBe(0)
     } finally {
@@ -424,8 +426,8 @@ describe('checkDynamicSender', () => {
         return new Response(null, { status })
       }) as unknown as typeof fetch
       await expect(
-        checkDynamicSender({ ...baseArgs(), fetchImpl }),
-      ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+        checkDynamicAuthorization({ ...baseArgs(), fetchImpl }),
+      ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     }
   })
 
@@ -437,8 +439,8 @@ describe('checkDynamicSender', () => {
       })
       const fetchImpl = (async () => response) as unknown as typeof fetch
       await expect(
-        checkDynamicSender({ ...baseArgs(), fetchImpl }),
-      ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+        checkDynamicAuthorization({ ...baseArgs(), fetchImpl }),
+      ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     }
   })
 
@@ -450,19 +452,19 @@ describe('checkDynamicSender', () => {
         )
       })) as unknown as typeof fetch
     await expect(
-      checkDynamicSender({
+      checkDynamicAuthorization({
         ...baseArgs(),
         check: config({ timeoutMs: 10 }),
         fetchImpl: timeoutFetch,
       }),
-    ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+    ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
 
     const networkFetch = (async () => {
       throw new Error('network down')
     }) as unknown as typeof fetch
     await expect(
-      checkDynamicSender({ ...baseArgs(), fetchImpl: networkFetch }),
-    ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+      checkDynamicAuthorization({ ...baseArgs(), fetchImpl: networkFetch }),
+    ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
   })
 
   test('fails closed before fetch for missing, empty, or malformed signing keys', async () => {
@@ -474,8 +476,8 @@ describe('checkDynamicSender', () => {
 
     for (const badEnv of [env(null), env(''), env('not-a-private-key')]) {
       await expect(
-        checkDynamicSender({ ...baseArgs(), env: badEnv, fetchImpl }),
-      ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+        checkDynamicAuthorization({ ...baseArgs(), env: badEnv, fetchImpl }),
+      ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     }
     expect(calls).toBe(0)
   })
@@ -483,7 +485,7 @@ describe('checkDynamicSender', () => {
   test('fails closed before cache or fetch when the key does not match the pinned identity', async () => {
     let cacheReads = 0
     let fetchCalls = 0
-    const cache: DynamicSendersCache = {
+    const cache: DynamicAuthorizationCache = {
       async get() {
         cacheReads++
         return '1'
@@ -496,7 +498,7 @@ describe('checkDynamicSender', () => {
     }) as unknown as typeof fetch
 
     await expect(
-      checkDynamicSender({
+      checkDynamicAuthorization({
         ...baseArgs(),
         check: config({
           signingIdentity: ATTACKER_KEYPAIR.toSuiAddress(),
@@ -505,7 +507,7 @@ describe('checkDynamicSender', () => {
         cache,
         fetchImpl,
       }),
-    ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+    ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     expect(cacheReads).toBe(0)
     expect(fetchCalls).toBe(0)
   })
@@ -518,26 +520,26 @@ describe('checkDynamicSender', () => {
     }) as unknown as typeof fetch
 
     await expect(
-      checkDynamicSender({
+      checkDynamicAuthorization({
         ...baseArgs(),
         sender: 'not-an-address',
         fetchImpl,
       }),
-    ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+    ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     await expect(
-      checkDynamicSender({
+      checkDynamicAuthorization({
         ...baseArgs(),
         network: 'testnet\nevil',
         fetchImpl,
       }),
-    ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+    ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     await expect(
-      checkDynamicSender({
+      checkDynamicAuthorization({
         ...baseArgs(),
         requestId: () => 'not-a-uuid',
         fetchImpl,
       }),
-    ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+    ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
     expect(calls).toBe(0)
   })
 
@@ -582,7 +584,7 @@ describe('checkDynamicSender', () => {
       }) as unknown as typeof fetch
 
       await expect(
-        checkDynamicSender({
+        checkDynamicAuthorization({
           ...baseArgs(),
           check: config({
             audience: invalid.audience,
@@ -594,7 +596,7 @@ describe('checkDynamicSender', () => {
           cache,
           fetchImpl,
         }),
-      ).rejects.toBeInstanceOf(DynamicSenderUnavailableError)
+      ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
       expect(fetchCalls).toBe(0)
     }
   })
@@ -606,8 +608,8 @@ describe('checkDynamicSender', () => {
       return new Response(null, { status: 204 })
     }) as unknown as typeof fetch
 
-    await checkDynamicSender({ ...baseArgs(), fetchImpl })
-    await checkDynamicSender({
+    await checkDynamicAuthorization({ ...baseArgs(), fetchImpl })
+    await checkDynamicAuthorization({
       ...baseArgs(),
       check: config({
         url: 'https://other.example/authorize',
@@ -632,7 +634,7 @@ describe('checkDynamicSender', () => {
     const cache = memoryCache()
     cache.store.set(CACHE_KEY, '1')
 
-    await checkDynamicSender({
+    await checkDynamicAuthorization({
       ...baseArgs(),
       check: config({ cacheTtlSeconds: 60 }),
       cache,
@@ -641,7 +643,7 @@ describe('checkDynamicSender', () => {
     expect(calls).toBe(0)
 
     cache.store.clear()
-    await checkDynamicSender({
+    await checkDynamicAuthorization({
       ...baseArgs(),
       check: config({ cacheTtlSeconds: 60 }),
       cache,
@@ -656,7 +658,7 @@ describe('checkDynamicSender', () => {
       const cache = memoryCache()
       const fetchImpl = (async () =>
         new Response(null, { status })) as unknown as typeof fetch
-      await checkDynamicSender({
+      await checkDynamicAuthorization({
         ...baseArgs(),
         check: config({ cacheTtlSeconds: 60 }),
         cache,
@@ -672,7 +674,7 @@ describe('checkDynamicSender', () => {
       calls++
       return new Response(null, { status: 204 })
     }) as unknown as typeof fetch
-    const cache: DynamicSendersCache = {
+    const cache: DynamicAuthorizationCache = {
       async get() {
         throw new Error('KV down')
       },
@@ -681,7 +683,7 @@ describe('checkDynamicSender', () => {
       },
     }
     await expect(
-      checkDynamicSender({
+      checkDynamicAuthorization({
         ...baseArgs(),
         check: config({ cacheTtlSeconds: 60 }),
         cache,
@@ -700,13 +702,13 @@ describe('checkDynamicSender', () => {
       return new Response(null, { status: 403 })
     }) as unknown as typeof fetch
     await expect(
-      checkDynamicSender({
+      checkDynamicAuthorization({
         ...baseArgs(),
         check: config({ cacheTtlSeconds: 60 }),
         cache,
         fetchImpl,
       }),
-    ).rejects.toBeInstanceOf(DynamicSenderDeniedError)
+    ).rejects.toBeInstanceOf(DynamicAuthorizationDeniedError)
     expect(calls).toBe(1)
   })
 
@@ -744,14 +746,14 @@ describe('checkDynamicSender', () => {
         return new Response(null, { status: 403 })
       }) as unknown as typeof fetch
       await expect(
-        checkDynamicSender({
+        checkDynamicAuthorization({
           ...baseArgs(),
           check: config({ cacheTtlSeconds: 60 }),
           ...mutation,
           cache,
           fetchImpl,
         }),
-      ).rejects.toBeInstanceOf(DynamicSenderDeniedError)
+      ).rejects.toBeInstanceOf(DynamicAuthorizationDeniedError)
       expect(calls).toBe(1)
     }
   })

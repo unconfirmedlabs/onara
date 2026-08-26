@@ -46,7 +46,7 @@ describe('policies()', () => {
         type: 'require',
         name: 'signed-in-user',
         check: {
-          kind: 'sender.dynamic',
+          kind: 'dynamic-authorization',
           url: 'https://api.example.com/v1/onara/authorize',
           audience: 'example-onara-authorization',
           signingKeyEnv: 'ONARA_SIGNING_KEY',

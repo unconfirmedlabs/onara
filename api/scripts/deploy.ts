@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { loadPolicies, type CompiledPolicies } from '../src/policy'
-import { parseDynamicSenderSigningKey } from '../src/dynamic-senders'
+import { parseDynamicAuthorizationSigningKey } from '../src/dynamic-authorization'
 import sponsorPoliciesConfig from '../policies'
 import {
   generatePoliciesIndex,
@@ -26,7 +26,7 @@ type ExternalDeployment = {
   compiledPolicies: CompiledPolicies
   wranglerConfig: string
   generatedWrangler: string | null
-  dynamicRequirementNames: string[]
+  dynamicAuthorizationRequirementNames: string[]
   source: 'unified' | 'legacy'
 }
 
@@ -132,7 +132,8 @@ async function loadExternalDeployment(
         compiledPolicies: deployment.compiledPolicies,
         wranglerConfig: '',
         generatedWrangler: generateWranglerConfig(deployment.wrangler),
-        dynamicRequirementNames: deployment.dynamicRequirementNames,
+        dynamicAuthorizationRequirementNames:
+          deployment.dynamicAuthorizationRequirementNames,
         source: 'unified',
       }
     }
@@ -152,14 +153,14 @@ async function loadExternalDeployment(
     compiledPolicies,
     wranglerConfig,
     generatedWrangler: null,
-    dynamicRequirementNames: compiledPolicies.require
+    dynamicAuthorizationRequirementNames: compiledPolicies.require
       .filter((requirement) => requirement.enabled)
       .map((requirement) => requirement.name),
     source: 'legacy',
   }
 }
 
-function preflightDynamicSenderSigningKeys(
+function preflightDynamicAuthorizationSigningKeys(
   policies: CompiledPolicies,
   envVars: Record<string, string>,
 ): void {
@@ -204,7 +205,7 @@ function preflightDynamicSenderSigningKeys(
       continue
     }
 
-    const keypair = parseDynamicSenderSigningKey(value)
+    const keypair = parseDynamicAuthorizationSigningKey(value)
     const derivedIdentity = keypair.toSuiAddress()
     if (derivedIdentity !== identity) {
       throw new Error(
@@ -242,7 +243,7 @@ async function main() {
   if (!configDir) {
     console.log(`${dryRun ? 'Validating' : 'Deploying'} with in-tree config...`)
     const compiled = loadPolicies(sponsorPoliciesConfig)
-    preflightDynamicSenderSigningKeys(compiled, loadEnvFile(API_DIR))
+    preflightDynamicAuthorizationSigningKeys(compiled, loadEnvFile(API_DIR))
     const args = ['wrangler', 'deploy', '--minify']
     if (dryRun) args.push('--dry-run')
     await run('npx', args, API_DIR)
@@ -254,10 +255,11 @@ async function main() {
   )
   const deployment = await loadExternalDeployment(configDir)
   const envVars = loadEnvFile(configDir)
-  preflightDynamicSenderSigningKeys(deployment.compiledPolicies, envVars)
-  if (deployment.dynamicRequirementNames.length > 0) {
+  preflightDynamicAuthorizationSigningKeys(deployment.compiledPolicies, envVars)
+  const authorizationNames = deployment.dynamicAuthorizationRequirementNames
+  if (authorizationNames.length > 0) {
     console.log(
-      `Dynamic sender requirements: ${deployment.dynamicRequirementNames.join(', ')}`,
+      `Dynamic authorization requirements: ${authorizationNames.join(', ')}`,
     )
   }
 

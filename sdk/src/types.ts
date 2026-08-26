@@ -18,8 +18,8 @@ export type PolicyCommandKind =
   | 'Publish'
   | 'Upgrade'
 
-export type DynamicSenderCheck = {
-  kind: 'sender.dynamic'
+export type DynamicAuthorizationCheck = {
+  kind: 'dynamic-authorization'
   url: string
   audience: string
   /** Name of the Worker secret containing the dedicated Bech32 signing key. */
@@ -35,7 +35,7 @@ export type RequirePolicyConfig = {
   type: 'require'
   name: string
   enabled?: boolean
-  check: DynamicSenderCheck
+  check: DynamicAuthorizationCheck
 }
 
 export type DenyPolicyWhen =

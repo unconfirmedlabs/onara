@@ -1,7 +1,6 @@
-// Dynamic sender whitelist — a sibling of the static per-policy `senders`
-// list. Instead of (or in addition to) a fixed address list, a policy can
-// point at an HTTP endpoint that decides, per request, whether the tx sender
-// may be sponsored under that policy.
+// Dynamic authorization evaluates a named external requirement for an
+// otherwise valid allow branch. The authorizer decides, per request, whether
+// the transaction sender may be sponsored under that concrete policy.
 //
 // Requests use a dedicated Sui key to sign a domain-separated personal
 // message. The receiver recovers the signer from the serialized signature and
@@ -18,29 +17,29 @@ import { Secp256k1Keypair } from '@mysten/sui/keypairs/secp256k1'
 import { Secp256r1Keypair } from '@mysten/sui/keypairs/secp256r1'
 import { isValidSuiAddress, normalizeSuiAddress } from '@mysten/sui/utils'
 import { verifyPersonalMessageSignature } from '@mysten/sui/verify'
-import type { DynamicSenderCheck } from './policy'
+import type { DynamicAuthorizationCheck } from './policy'
 
-export class DynamicSenderDeniedError extends Error {}
-export class DynamicSenderUnavailableError extends Error {}
+export class DynamicAuthorizationDeniedError extends Error {}
+export class DynamicAuthorizationUnavailableError extends Error {}
 
 /**
  * Minimal KV-like cache surface — matches the subset of Cloudflare's
  * `KVNamespace` this module needs, so it can be swapped out in tests.
  */
-export type DynamicSendersCache = {
+export type DynamicAuthorizationCache = {
   get(key: string): Promise<string | null>
   put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>
 }
 
-export const DYNAMIC_SENDER_AUTHORIZATION_DOMAIN =
-  'onara.dynamic-senders.v1'
-export const DYNAMIC_SENDER_AUTHORIZATION_METHOD = 'GET'
+export const DYNAMIC_AUTHORIZATION_DOMAIN =
+  'onara.dynamic-authorization.v1'
+export const DYNAMIC_AUTHORIZATION_REQUEST_METHOD = 'GET'
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const VISIBLE_ASCII = /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/
 
-export type DynamicSenderAuthorizationFields = {
+export type DynamicAuthorizationRequestFields = {
   audience: string
   sender: string
   requirementName: string
@@ -50,8 +49,8 @@ export type DynamicSenderAuthorizationFields = {
   requestId: string
 }
 
-export type SignedDynamicSenderAuthorization =
-  DynamicSenderAuthorizationFields & {
+export type SignedDynamicAuthorizationRequest =
+  DynamicAuthorizationRequestFields & {
     identity: string
     signature: string
   }
@@ -74,7 +73,7 @@ const cacheKey = ({
   signingIdentity: string
 }) =>
   [
-    'dynsender',
+    'dynamic-authorization',
     'v1',
     audience,
     url,
@@ -100,7 +99,7 @@ function assertSignedHeaderValue(field: string, value: string): void {
 }
 
 function assertAuthorizationFields(
-  fields: DynamicSenderAuthorizationFields,
+  fields: DynamicAuthorizationRequestFields,
 ): void {
   assertSignedHeaderValue('audience', fields.audience)
   assertSignedHeaderValue('requirementName', fields.requirementName)
@@ -125,13 +124,13 @@ function assertAuthorizationFields(
  * CR/LF and other non-visible-ASCII characters are rejected in configured
  * values, making this line encoding unambiguous across implementations.
  */
-export function buildDynamicSenderAuthorizationMessage(
-  fields: DynamicSenderAuthorizationFields,
+export function buildDynamicAuthorizationRequestMessage(
+  fields: DynamicAuthorizationRequestFields,
 ): Uint8Array {
   assertAuthorizationFields(fields)
   const sender = normalizeSuiAddress(fields.sender)
   return new TextEncoder().encode(
-    `${DYNAMIC_SENDER_AUTHORIZATION_DOMAIN}\n` +
+    `${DYNAMIC_AUTHORIZATION_DOMAIN}\n` +
       `audience:${fields.audience}\n` +
       `sender:${sender}\n` +
       `requirement:${fields.requirementName}\n` +
@@ -139,12 +138,12 @@ export function buildDynamicSenderAuthorizationMessage(
       `network:${fields.network}\n` +
       `timestamp:${fields.timestamp}\n` +
       `request-id:${fields.requestId}\n` +
-      `method:${DYNAMIC_SENDER_AUTHORIZATION_METHOD}`,
+      `method:${DYNAMIC_AUTHORIZATION_REQUEST_METHOD}`,
   )
 }
 
 /** Parse a Bech32 `suiprivkey...` into one of the SDK's software keypairs. */
-export function parseDynamicSenderSigningKey(value: string): Keypair {
+export function parseDynamicAuthorizationSigningKey(value: string): Keypair {
   const parsed = decodeSuiPrivateKey(value)
   switch (parsed.scheme) {
     case 'ED25519':
@@ -155,7 +154,7 @@ export function parseDynamicSenderSigningKey(value: string): Keypair {
       return Secp256r1Keypair.fromSecretKey(parsed.secretKey)
     default:
       throw new Error(
-        `Unsupported dynamic sender signing key scheme: ${parsed.scheme}`,
+        `Unsupported dynamic authorization signing key scheme: ${parsed.scheme}`,
       )
   }
 }
@@ -165,17 +164,17 @@ export function parseDynamicSenderSigningKey(value: string): Keypair {
  * `timestamp` for deterministic interoperability tests; production callers
  * should generate a fresh UUID and current timestamp per outbound request.
  */
-export async function signDynamicSenderAuthorization({
+export async function signDynamicAuthorizationRequest({
   signingKey,
   ...fields
-}: DynamicSenderAuthorizationFields & {
+}: DynamicAuthorizationRequestFields & {
   signingKey: Keypair
-}): Promise<SignedDynamicSenderAuthorization> {
+}): Promise<SignedDynamicAuthorizationRequest> {
   const normalizedFields = {
     ...fields,
     sender: normalizeSuiAddress(fields.sender),
   }
-  const message = buildDynamicSenderAuthorizationMessage(normalizedFields)
+  const message = buildDynamicAuthorizationRequestMessage(normalizedFields)
   const { signature } = await signingKey.signPersonalMessage(message)
 
   return {
@@ -196,7 +195,7 @@ export async function signDynamicSenderAuthorization({
  * need single-use requests must persist consumed IDs for at least the accepted
  * timestamp window.
  */
-export async function verifyDynamicSenderAuthorization({
+export async function verifyDynamicAuthorizationRequest({
   requestMethod,
   expectedAudience,
   expectedNetwork,
@@ -207,7 +206,7 @@ export async function verifyDynamicSenderAuthorization({
   maxSkewSeconds = 300,
   now = () => Date.now(),
   ...fields
-}: SignedDynamicSenderAuthorization & {
+}: SignedDynamicAuthorizationRequest & {
   requestMethod: string
   expectedAudience: string
   expectedNetwork: string
@@ -218,7 +217,7 @@ export async function verifyDynamicSenderAuthorization({
 }): Promise<boolean> {
   try {
     if (
-      requestMethod !== DYNAMIC_SENDER_AUTHORIZATION_METHOD ||
+      requestMethod !== DYNAMIC_AUTHORIZATION_REQUEST_METHOD ||
       fields.audience !== expectedAudience ||
       fields.network !== expectedNetwork ||
       !allowedRequirementPolicies[fields.requirementName]?.includes(
@@ -264,7 +263,7 @@ export async function verifyDynamicSenderAuthorization({
       return false
     }
 
-    const message = buildDynamicSenderAuthorizationMessage(fields)
+    const message = buildDynamicAuthorizationRequestMessage(fields)
     const publicKey = await verifyPersonalMessageSignature(message, signature)
     return publicKey.toSuiAddress() === normalizedIdentity
   } catch {
@@ -273,18 +272,19 @@ export async function verifyDynamicSenderAuthorization({
 }
 
 /**
- * Calls the policy's configured dynamic sender endpoint to decide whether
+ * Calls the policy's configured dynamic authorization endpoint to decide whether
  * `sender` may be sponsored under `policyName`.
  *
  * `sender` MUST originate from the verified transaction bytes, not from an
  * unverified client-supplied field. It is normalized again defensively here.
  *
- * Resolves on allow (204, or a cache hit). Throws `DynamicSenderDeniedError`
- * on an explicit 403, or `DynamicSenderUnavailableError` for everything else
- * (missing/malformed key, signing failure, timeout, redirect, network error,
+ * Resolves on allow (204, or a cache hit). Throws
+ * `DynamicAuthorizationDeniedError` on an explicit 403, or
+ * `DynamicAuthorizationUnavailableError` for everything else (missing or
+ * malformed key, signing failure, timeout, redirect, network error, or an
  * unexpected status). The caller must treat both as "do not sponsor".
  */
-export async function checkDynamicSender({
+export async function checkDynamicAuthorization({
   check,
   requirementName,
   policyName,
@@ -296,30 +296,30 @@ export async function checkDynamicSender({
   now = () => Date.now(),
   requestId = () => crypto.randomUUID(),
 }: {
-  check: DynamicSenderCheck
+  check: DynamicAuthorizationCheck
   requirementName: string
   policyName: string
   sender: string
   network: string
   env: Record<string, unknown>
-  cache?: DynamicSendersCache
+  cache?: DynamicAuthorizationCache
   fetchImpl?: typeof fetch
   now?: () => number
   requestId?: () => string
 }): Promise<void> {
   const privateKey = env[check.signingKeyEnv]
   if (typeof privateKey !== 'string' || privateKey.length === 0) {
-    throw new DynamicSenderUnavailableError(
-      `Dynamic sender signing key env var "${check.signingKeyEnv}" is missing or empty.`,
+    throw new DynamicAuthorizationUnavailableError(
+      `Dynamic authorization signing key env var "${check.signingKeyEnv}" is missing or empty.`,
     )
   }
 
   let signingKey: Keypair
   try {
-    signingKey = parseDynamicSenderSigningKey(privateKey)
+    signingKey = parseDynamicAuthorizationSigningKey(privateKey)
   } catch {
-    throw new DynamicSenderUnavailableError(
-      `Dynamic sender signing key env var "${check.signingKeyEnv}" is malformed or unsupported.`,
+    throw new DynamicAuthorizationUnavailableError(
+      `Dynamic authorization signing key env var "${check.signingKeyEnv}" is malformed or unsupported.`,
     )
   }
 
@@ -329,14 +329,14 @@ export async function checkDynamicSender({
     check.signingIdentity !== normalizeSuiAddress(check.signingIdentity) ||
     derivedIdentity !== check.signingIdentity
   ) {
-    throw new DynamicSenderUnavailableError(
-      `Dynamic sender signing key env var "${check.signingKeyEnv}" does not match its configured public identity.`,
+    throw new DynamicAuthorizationUnavailableError(
+      `Dynamic authorization signing key env var "${check.signingKeyEnv}" does not match its configured public identity.`,
     )
   }
 
   if (!isValidSuiAddress(sender)) {
-    throw new DynamicSenderUnavailableError(
-      'Dynamic sender check received an invalid Sui address.',
+    throw new DynamicAuthorizationUnavailableError(
+      'Dynamic authorization check received an invalid Sui address.',
     )
   }
   const normalizedSender = normalizeSuiAddress(sender)
@@ -351,8 +351,8 @@ export async function checkDynamicSender({
     assertSignedHeaderValue('policyName', policyName)
     assertSignedHeaderValue('network', network)
   } catch {
-    throw new DynamicSenderUnavailableError(
-      'Dynamic sender authorization fields are malformed.',
+    throw new DynamicAuthorizationUnavailableError(
+      'Dynamic authorization fields are malformed.',
     )
   }
 
@@ -375,7 +375,7 @@ export async function checkDynamicSender({
       if (hit !== null) {
         console.error(
           JSON.stringify({
-            message: 'Ignoring invalid dynamic sender cache entry.',
+            message: 'Ignoring invalid dynamic authorization cache entry.',
             policy: policyName,
           }),
         )
@@ -383,7 +383,7 @@ export async function checkDynamicSender({
     } catch (cause) {
       console.error(
         JSON.stringify({
-          message: 'Dynamic sender cache read failed.',
+          message: 'Dynamic authorization cache read failed.',
           policy: policyName,
           error: cause instanceof Error ? cause.message : String(cause),
         }),
@@ -391,9 +391,9 @@ export async function checkDynamicSender({
     }
   }
 
-  let signed: SignedDynamicSenderAuthorization
+  let signed: SignedDynamicAuthorizationRequest
   try {
-    signed = await signDynamicSenderAuthorization({
+    signed = await signDynamicAuthorizationRequest({
       signingKey,
       audience: check.audience,
       sender: normalizedSender,
@@ -404,8 +404,8 @@ export async function checkDynamicSender({
       requestId: requestId(),
     })
   } catch {
-    throw new DynamicSenderUnavailableError(
-      'Unable to sign dynamic sender authorization request.',
+    throw new DynamicAuthorizationUnavailableError(
+      'Unable to sign dynamic authorization request.',
     )
   }
 
@@ -424,23 +424,23 @@ export async function checkDynamicSender({
       'User-Agent': 'onara',
     })
   } catch {
-    throw new DynamicSenderUnavailableError(
-      'Unable to construct dynamic sender authorization request.',
+    throw new DynamicAuthorizationUnavailableError(
+      'Unable to construct dynamic authorization request.',
     )
   }
 
   let response: Response
   try {
     response = await fetchImpl(check.url, {
-      method: DYNAMIC_SENDER_AUTHORIZATION_METHOD,
+      method: DYNAMIC_AUTHORIZATION_REQUEST_METHOD,
       headers,
       redirect: 'manual',
       signal: AbortSignal.timeout(check.timeoutMs),
     })
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : 'unknown error'
-    throw new DynamicSenderUnavailableError(
-      `Dynamic sender check request failed: ${message}`,
+    throw new DynamicAuthorizationUnavailableError(
+      `Dynamic authorization check request failed: ${message}`,
     )
   }
 
@@ -449,8 +449,8 @@ export async function checkDynamicSender({
     response.redirected ||
     (response.status >= 300 && response.status < 400)
   ) {
-    throw new DynamicSenderUnavailableError(
-      `Dynamic sender check refused redirect response: ${response.status}`,
+    throw new DynamicAuthorizationUnavailableError(
+      `Dynamic authorization check refused redirect response: ${response.status}`,
     )
   }
 
@@ -463,7 +463,7 @@ export async function checkDynamicSender({
       } catch (cause) {
         console.error(
           JSON.stringify({
-            message: 'Dynamic sender cache write failed.',
+            message: 'Dynamic authorization cache write failed.',
             policy: policyName,
             error: cause instanceof Error ? cause.message : String(cause),
           }),
@@ -474,12 +474,12 @@ export async function checkDynamicSender({
   }
 
   if (response.status === 403) {
-    throw new DynamicSenderDeniedError(
-      `Sender not in dynamic whitelist for policy "${policyName}".`,
+    throw new DynamicAuthorizationDeniedError(
+      `Dynamic authorization denied for policy "${policyName}".`,
     )
   }
 
-  throw new DynamicSenderUnavailableError(
-    `Dynamic sender check returned unexpected status: ${response.status}`,
+  throw new DynamicAuthorizationUnavailableError(
+    `Dynamic authorization check returned unexpected status: ${response.status}`,
   )
 }

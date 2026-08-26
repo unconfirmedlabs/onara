@@ -76,9 +76,9 @@ const envVarNameSchema = z
     'signingKeyEnv must be a valid environment variable name.',
   )
 
-const dynamicSenderCheckSchema = z
+const dynamicAuthorizationCheckSchema = z
   .object({
-    kind: z.literal('sender.dynamic'),
+    kind: z.literal('dynamic-authorization'),
     url: z.string().min(1),
     audience: namedValueSchema('check.audience'),
     signingKeyEnv: envVarNameSchema,
@@ -107,14 +107,16 @@ const dynamicSenderCheckSchema = z
     }
   }, 'check.url must be https:// (http:// is only allowed for localhost/127.0.0.1).')
 
-export type DynamicSenderCheck = z.infer<typeof dynamicSenderCheckSchema>
+export type DynamicAuthorizationCheck = z.infer<
+  typeof dynamicAuthorizationCheckSchema
+>
 
 const requirePolicySchema = z
   .object({
     type: z.literal('require'),
     name: namedValueSchema('Requirement name'),
     enabled: z.boolean().default(true),
-    check: dynamicSenderCheckSchema,
+    check: dynamicAuthorizationCheckSchema,
   })
   .strict()
 
@@ -389,7 +391,7 @@ export type CompiledRequirement = {
   type: 'require'
   name: string
   enabled: boolean
-  check: DynamicSenderCheck
+  check: DynamicAuthorizationCheck
 }
 
 export type CompiledDenyPolicy = {

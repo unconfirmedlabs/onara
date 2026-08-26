@@ -5,7 +5,7 @@ export type {
   StatusResponse,
   PolicyConfig,
   PolicyCommandKind,
-  DynamicSenderCheck,
+  DynamicAuthorizationCheck,
   RequirePolicyConfig,
   DenyPolicyWhen,
   DenyPolicyConfig,

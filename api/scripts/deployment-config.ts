@@ -20,7 +20,7 @@ export type ResolvedUnifiedDeploymentConfig = {
   wrangler: JsonObject
   policies: unknown[]
   compiledPolicies: CompiledPolicies
-  dynamicRequirementNames: string[]
+  dynamicAuthorizationRequirementNames: string[]
 }
 
 function isRecord(value: unknown): value is JsonObject {
@@ -83,14 +83,17 @@ export function parseUnifiedDeploymentConfig(
   }
 
   const compiledPolicies = loadPolicies(parsed.data.policies)
-  const dynamicRequirements = compiledPolicies.require.filter(
+  const dynamicAuthorizationRequirements = compiledPolicies.require.filter(
     (requirement) => requirement.enabled,
   )
-  const dynamicRequirementNames = dynamicRequirements.map(
-    (requirement) => requirement.name,
-  )
+  const dynamicAuthorizationRequirementNames =
+    dynamicAuthorizationRequirements.map(
+      (requirement) => requirement.name,
+    )
   const signingKeyEnvs = new Set(
-    dynamicRequirements.map((requirement) => requirement.check.signingKeyEnv),
+    dynamicAuthorizationRequirements.map(
+      (requirement) => requirement.check.signingKeyEnv,
+    ),
   )
   validateWranglerConfig(parsed.data.wrangler, signingKeyEnvs)
 
@@ -99,7 +102,7 @@ export function parseUnifiedDeploymentConfig(
     wrangler: parsed.data.wrangler,
     policies: parsed.data.policies,
     compiledPolicies,
-    dynamicRequirementNames,
+    dynamicAuthorizationRequirementNames,
   }
 }
 

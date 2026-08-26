@@ -22,10 +22,10 @@ import {
   OwnedInputAuthorizationError,
 } from './input-authorization'
 import {
-  checkDynamicSender,
-  DynamicSenderDeniedError,
-  type DynamicSendersCache,
-} from './dynamic-senders'
+  checkDynamicAuthorization,
+  DynamicAuthorizationDeniedError,
+  type DynamicAuthorizationCache,
+} from './dynamic-authorization'
 import { executeTransaction, type OnStatus, type SponsorEvent } from './execution'
 import { writeAnalytics } from './analytics'
 import {
@@ -58,7 +58,7 @@ type Bindings = {
   HAYABUSA?: { fetch: typeof fetch }
   SENDER_RATE_LIMIT?: RateLimitBinding
   IP_RATE_LIMIT?: RateLimitBinding
-  DYNAMIC_SENDERS_CACHE?: DynamicSendersCache
+  DYNAMIC_AUTHORIZATION_CACHE?: DynamicAuthorizationCache
 }
 
 const DEFAULT_EXECUTION_TIMEOUT_MS = 45_000
@@ -216,21 +216,21 @@ async function evaluateAuthorizationPlan({
     allowBranches: plan.allowBranches,
     evaluate: async ({ requirement, policyName }) => {
       try {
-        await checkDynamicSender({
+        await checkDynamicAuthorization({
           check: requirement.check,
           requirementName: requirement.name,
           policyName,
           sender,
           network: bindings.SUI_NETWORK,
           env: bindings as Record<string, unknown>,
-          cache: bindings.DYNAMIC_SENDERS_CACHE,
+          cache: bindings.DYNAMIC_AUTHORIZATION_CACHE,
         })
         return 'allow'
       } catch (error) {
         const message =
           error instanceof Error
             ? error.message
-            : 'Dynamic sender check failed.'
+            : 'Dynamic authorization check failed.'
         console.error(
           JSON.stringify({
             message: 'Policy requirement check failed.',
@@ -240,7 +240,7 @@ async function evaluateAuthorizationPlan({
             error: message,
           }),
         )
-        return error instanceof DynamicSenderDeniedError
+        return error instanceof DynamicAuthorizationDeniedError
           ? 'deny'
           : 'unavailable'
       }

@@ -12,8 +12,9 @@ and submits the transaction to Sui.
   exact allow branches in one versioned JSON configuration.
 - **Fail-closed authorization.** A transaction must satisfy a complete allow
   branch, and any matching deny policy wins.
-- **Sender-aware sponsorship.** Dynamic sender requirements call an external
-  authorizer with a domain-separated request signed by a dedicated Sui identity.
+- **Sender-aware sponsorship.** Dynamic authorization requirements call an
+  external authorizer with a domain-separated request signed by a dedicated
+  Sui identity.
 - **Sui SDK integration.** Use the published TypeScript client directly or as a
   native Sui client extension.
 - **Cloudflare-native operation.** The server runs on Workers with optional KV,
@@ -90,7 +91,7 @@ An Onara deployment has one authoritative `config.json`:
       "type": "require",
       "name": "known-user",
       "check": {
-        "kind": "sender.dynamic",
+        "kind": "dynamic-authorization",
         "url": "https://api.example.com/v1/onara/authorize",
         "audience": "example-onara-authorization",
         "signingKeyEnv": "ONARA_AUTHORIZER_SIGNING_KEY",
@@ -135,7 +136,7 @@ deny override; OR(allows); AND(requirements)
 ```
 
 - `require` defines a reusable external authorization check. Schema v1 supports
-  `sender.dynamic`.
+  `dynamic-authorization`.
 - `deny` rejects an absolute or structurally matched transaction before allows
   are considered.
 - `allow` defines one complete transaction-shape branch. Its `requires` field is

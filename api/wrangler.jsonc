@@ -14,11 +14,11 @@
   // "vars": {
   //   "GAS_BUDGET_MAX": "50000000000"
   // },
-  // Every `senders.dynamic.signingKeyEnv` names a Worker secret containing a
+  // Every `require.check.signingKeyEnv` names a Worker secret containing a
   // Bech32 `suiprivkey...`. Provision each one separately, for example:
   //   wrangler secret put MY_APP_ONARA_SIGNING_KEY
   // The matching public address must be pinned in that policy's
-  // `senders.dynamic.signingIdentity` field.
+  // `require.check.signingIdentity` field.
   // Prefer a dedicated request-signing key per external trust domain; do not
   // reuse the sponsor gas key or put a raw private key in policy JSON/vars.
   // Optional: enable sponsorship analytics
@@ -45,10 +45,10 @@
   //     }
   //   ]
   // },
-  // Optional: KV namespace used to cache dynamic sender allow decisions for
-  // policies with `senders.dynamic.cacheTtlSeconds > 0`. Without this
-  // binding, dynamic sender checks are never cached.
+  // Optional: KV namespace used to cache dynamic authorization allow decisions
+  // for requirements with `check.cacheTtlSeconds > 0`. Without this binding,
+  // dynamic authorization decisions are never cached.
   // "kv_namespaces": [
-  //   { "binding": "DYNAMIC_SENDERS_CACHE", "id": "<kv-namespace-id>" }
+  //   { "binding": "DYNAMIC_AUTHORIZATION_CACHE", "id": "<kv-namespace-id>" }
   // ]
 }

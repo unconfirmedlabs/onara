@@ -27,7 +27,7 @@ function requirement(name = 'sender-ok') {
     type: 'require',
     name,
     check: {
-      kind: 'sender.dynamic',
+      kind: 'dynamic-authorization',
       url: 'https://example.com/authorize',
       audience: 'test-authorizer',
       signingKeyEnv: 'TEST_ONARA_SIGNING_KEY',
@@ -301,7 +301,7 @@ describe('schema-v1 compilation', () => {
     ).not.toThrow()
   })
 
-  test('dynamic checks require canonical trust data and fail-closed URL defaults', () => {
+  test('dynamic authorization checks require canonical trust data and fail-closed URL defaults', () => {
     const compiled = loadPolicies([
       requirement(),
       allow({ requires: ['sender-ok'] }),
@@ -310,6 +310,7 @@ describe('schema-v1 compilation', () => {
     expect(compiled.require[0]!.check.cacheTtlSeconds).toBe(0)
 
     for (const check of [
+      { ...requirement().check, kind: 'sender.dynamic' },
       { ...requirement().check, signingIdentity: '0x1' },
       { ...requirement().check, audience: 'bad\naudience' },
       { ...requirement().check, signingKeyEnv: 'bad-name' },

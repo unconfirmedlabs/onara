@@ -14,7 +14,7 @@ function requirement(name = 'miso-sender'): Record<string, unknown> {
     type: 'require',
     name,
     check: {
-      kind: 'sender.dynamic',
+      kind: 'dynamic-authorization',
       url: 'https://api.testnet.miso.fm/v1/onara/authorize',
       audience: 'miso-onara-authorization',
       signingKeyEnv: 'MISO_ONARA_SIGNING_KEY',
@@ -57,7 +57,7 @@ function config(
 }
 
 describe('unified deployment config', () => {
-  test('keeps flat policies and reports enabled dynamic requirements in source order', () => {
+  test('keeps flat policies and reports enabled dynamic authorization requirements in source order', () => {
     const policies = [
       requirement('first'),
       allow('first-allow', ['first']),
@@ -67,7 +67,10 @@ describe('unified deployment config', () => {
     const parsed = parseUnifiedDeploymentConfig(config(policies))
 
     expect(parsed.policies).toEqual(policies)
-    expect(parsed.dynamicRequirementNames).toEqual(['first', 'second'])
+    expect(parsed.dynamicAuthorizationRequirementNames).toEqual([
+      'first',
+      'second',
+    ])
     expect(parsed.compiledPolicies.require).toHaveLength(2)
     expect(parsed.compiledPolicies.allow).toHaveLength(2)
   })
