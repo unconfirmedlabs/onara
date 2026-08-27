@@ -1,5 +1,5 @@
 import type { SuiGrpcClient } from '@mysten/sui/grpc'
-import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
+import type { Keypair } from '@mysten/sui/cryptography'
 import type { SuiClientTypes } from '@mysten/sui/client'
 import pTimeout from 'p-timeout'
 import pRetry from 'p-retry'
@@ -33,7 +33,7 @@ export type ExecutionOutcome =
 
 export interface ExecutionParams {
   grpcClient: SuiGrpcClient
-  keypair: Ed25519Keypair
+  keypair: Keypair
   txBytes: Uint8Array
   txSignature: string
   waitForExecution: boolean

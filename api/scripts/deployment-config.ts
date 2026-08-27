@@ -27,10 +27,7 @@ function isRecord(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function validateWranglerConfig(
-  wrangler: JsonObject,
-  signingKeyEnvs: Set<string>,
-): void {
+function validateWranglerConfig(wrangler: JsonObject): void {
   for (const field of ['name', 'main', 'compatibility_date']) {
     if (typeof wrangler[field] !== 'string' || wrangler[field].length === 0) {
       throw new Error(`Unified deployment wrangler.${field} is required.`)
@@ -49,7 +46,6 @@ function validateWranglerConfig(
 
   for (const [name, value] of Object.entries(vars ?? {})) {
     if (
-      signingKeyEnvs.has(name) ||
       /(?:_PRIVATE_KEY|_SIGNING_KEY|_MNEMONIC|_SECRET)$/.test(name)
     ) {
       throw new Error(
@@ -90,12 +86,7 @@ export function parseUnifiedDeploymentConfig(
     dynamicAuthorizationRequirements.map(
       (requirement) => requirement.name,
     )
-  const signingKeyEnvs = new Set(
-    dynamicAuthorizationRequirements.map(
-      (requirement) => requirement.check.signingKeyEnv,
-    ),
-  )
-  validateWranglerConfig(parsed.data.wrangler, signingKeyEnvs)
+  validateWranglerConfig(parsed.data.wrangler)
 
   return {
     version: 1,

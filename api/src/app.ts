@@ -7,7 +7,7 @@ import { z } from 'zod'
 import { Transaction } from '@mysten/sui/transactions'
 import { SuiGrpcClient } from '@mysten/sui/grpc'
 import { GrpcWebFetchTransport } from '@protobuf-ts/grpcweb-transport'
-import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
+import type { Keypair } from '@mysten/sui/cryptography'
 import { fromBase64, isValidSuiAddress, normalizeSuiAddress } from '@mysten/sui/utils'
 import pRetry from 'p-retry'
 import {
@@ -37,6 +37,7 @@ import {
   type RateLimitBinding,
 } from './request-guards'
 import sponsorPoliciesConfig from '../policies'
+import { parseSponsorKeypair } from './sponsor-key'
 
 interface AnalyticsEngineDataset {
   writeDataPoint(event: {
@@ -49,7 +50,7 @@ interface AnalyticsEngineDataset {
 type Bindings = {
   SUI_GRPC_URL: string
   SUI_NETWORK: string
-  SUI_MNEMONIC: string
+  SUI_PRIVATE_KEY: string
   DRY_RUN_ONLY?: string
   EXECUTION_TIMEOUT_MS?: string
   CONFIRMATION_TIMEOUT_MS?: string
@@ -113,21 +114,21 @@ const createPinningFetch = (serviceBinding: { fetch: typeof fetch }): typeof fet
   }) as typeof fetch
 }
 
-let _keypair: Ed25519Keypair | null = null
+let _keypair: Keypair | null = null
 let _keypairKey = ''
 let _sponsorAddress = ''
 
-const getKeyPair = (mnemonic: string): Ed25519Keypair => {
-  if (_keypair && _keypairKey === mnemonic) return _keypair
-  _keypair = Ed25519Keypair.deriveKeypair(mnemonic)
-  _keypairKey = mnemonic
+const getKeyPair = (privateKey: string): Keypair => {
+  if (_keypair && _keypairKey === privateKey) return _keypair
+  _keypair = parseSponsorKeypair(privateKey)
+  _keypairKey = privateKey
   _sponsorAddress = _keypair.toSuiAddress()
   return _keypair
 }
 
-const getSponsorAddress = (mnemonic: string): string => {
-  if (_sponsorAddress && _keypairKey === mnemonic) return _sponsorAddress
-  getKeyPair(mnemonic)
+const getSponsorAddress = (privateKey: string): string => {
+  if (_sponsorAddress && _keypairKey === privateKey) return _sponsorAddress
+  getKeyPair(privateKey)
   return _sponsorAddress
 }
 
@@ -211,6 +212,7 @@ async function evaluateAuthorizationPlan({
 }): Promise<AuthorizationDecision> {
   const txData = Transaction.from(txBytesBase64).getData()
   const sender = normalizeSuiAddress(txData.sender!)
+  const signingKey = getKeyPair(bindings.SUI_PRIVATE_KEY)
 
   return evaluatePolicyRequirements({
     allowBranches: plan.allowBranches,
@@ -222,7 +224,7 @@ async function evaluateAuthorizationPlan({
           policyName,
           sender,
           network: bindings.SUI_NETWORK,
-          env: bindings as Record<string, unknown>,
+          signingKey,
           cache: bindings.DYNAMIC_AUTHORIZATION_CACHE,
         })
         return 'allow'
@@ -251,11 +253,11 @@ async function evaluateAuthorizationPlan({
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/status', async (c) => {
-  const { SUI_NETWORK, SUI_GRPC_URL, SUI_MNEMONIC, HAYABUSA } = env<Bindings>(c)
+  const { SUI_NETWORK, SUI_GRPC_URL, SUI_PRIVATE_KEY, HAYABUSA } = env<Bindings>(c)
 
   startTime(c, 'init', 'Client & keypair init')
   const grpcClient = getGrpcClient(SUI_NETWORK, SUI_GRPC_URL, HAYABUSA)
-  const address = getSponsorAddress(SUI_MNEMONIC)
+  const address = getSponsorAddress(SUI_PRIVATE_KEY)
   endTime(c, 'init')
 
   let chainId: string | null = null
@@ -354,8 +356,8 @@ app.post('/sponsor', async (c) => {
   // Fresh client per request when hayabusa is bound — pinning fetch holds per-request
   // state to route follow-up reads to the same backend that saw the first response.
   const grpcClient = createGrpcClient(bindings)
-  const keypair = getKeyPair(bindings.SUI_MNEMONIC)
-  const sponsorAddress = getSponsorAddress(bindings.SUI_MNEMONIC)
+  const keypair = getKeyPair(bindings.SUI_PRIVATE_KEY)
+  const sponsorAddress = getSponsorAddress(bindings.SUI_PRIVATE_KEY)
   endTime(c, 'init')
 
   // Resolve SuiNS name only when a policy requires it
@@ -598,8 +600,8 @@ app.get(
         const confirmationTimeoutMs = resolveConfirmationTimeout(bindings)
 
         const grpcClient = createGrpcClient(bindings)
-        const keypair = getKeyPair(bindings.SUI_MNEMONIC)
-        const sponsorAddress = getSponsorAddress(bindings.SUI_MNEMONIC)
+        const keypair = getKeyPair(bindings.SUI_PRIVATE_KEY)
+        const sponsorAddress = getSponsorAddress(bindings.SUI_PRIVATE_KEY)
 
         // SuiNS resolution
         let senderName: string | null = null

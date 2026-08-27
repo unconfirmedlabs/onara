@@ -53,12 +53,6 @@ const uniqueStringsSchema = (field: string, allowEmpty = false) => {
   )
 }
 
-const canonicalAddressSchema = z.string().refine(
-  (value) =>
-    isValidSuiAddress(value) && normalizeSuiAddress(value) === value,
-  'Expected a canonical Sui address.',
-)
-
 const addressSchema = z
   .string()
   .refine(
@@ -69,20 +63,11 @@ const addressSchema = z
 const isLocalHostname = (hostname: string): boolean =>
   hostname === 'localhost' || hostname === '127.0.0.1'
 
-const envVarNameSchema = z
-  .string()
-  .regex(
-    /^[A-Za-z_][A-Za-z0-9_]*$/,
-    'signingKeyEnv must be a valid environment variable name.',
-  )
-
 const dynamicAuthorizationCheckSchema = z
   .object({
     kind: z.literal('dynamic-authorization'),
     url: z.string().min(1),
     audience: namedValueSchema('check.audience'),
-    signingKeyEnv: envVarNameSchema,
-    signingIdentity: canonicalAddressSchema,
     timeoutMs: z.number().int().positive().default(1500),
     cacheTtlSeconds: z
       .number()

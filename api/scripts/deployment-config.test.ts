@@ -6,9 +6,6 @@ import {
   parseUnifiedDeploymentConfigText,
 } from './deployment-config'
 
-const IDENTITY =
-  '0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f'
-
 function requirement(name = 'miso-sender'): Record<string, unknown> {
   return {
     type: 'require',
@@ -17,8 +14,6 @@ function requirement(name = 'miso-sender'): Record<string, unknown> {
       kind: 'dynamic-authorization',
       url: 'https://api.testnet.miso.fm/v1/onara/authorize',
       audience: 'miso-onara-authorization',
-      signingKeyEnv: 'MISO_ONARA_SIGNING_KEY',
-      signingIdentity: IDENTITY,
       timeoutMs: 1500,
       cacheTtlSeconds: 0,
     },
@@ -97,7 +92,7 @@ describe('unified deployment config', () => {
           },
         ]),
       ),
-    ).toThrow(/canonical Sui address/)
+    ).toThrow(/Unrecognized key/)
   })
 
   test('rejects reference registries and dynamic refs', () => {

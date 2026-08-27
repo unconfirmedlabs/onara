@@ -94,8 +94,6 @@ An Onara deployment has one authoritative `config.json`:
         "kind": "dynamic-authorization",
         "url": "https://api.example.com/v1/onara/authorize",
         "audience": "example-onara-authorization",
-        "signingKeyEnv": "ONARA_AUTHORIZER_SIGNING_KEY",
-        "signingIdentity": "0x<canonical-public-sui-address>",
         "timeoutMs": 1500,
         "cacheTtlSeconds": 0
       }
@@ -158,10 +156,10 @@ requires that:
 4. commands do not reference `GasCoin`; and
 5. every owned object input is sender-owned or immutable.
 
-Dynamic authorizer requests use a separate Sui signing key selected by
-`signingKeyEnv`. Its public address is pinned in `signingIdentity`; private keys
-must be provisioned as Worker secrets and never placed in `config.json`. Use a
-dedicated authorization key rather than reusing the gas sponsor key.
+Dynamic authorization requests are signed by the sponsor key configured in
+`SUI_PRIVATE_KEY`. Onara derives its public address for `X-Onara-Identity`, so
+policies contain neither private key material nor a redundant signer address.
+Receivers must independently trust the sponsor address.
 
 See [`api/README.md`](./api/README.md) for the complete schema, request signing
 format, endpoint contract, rate limits, bindings, and operational details.
@@ -194,15 +192,13 @@ pass its directory to the deployment script:
 
 ```bash
 cd api
-wrangler secret put SUI_MNEMONIC
-wrangler secret put ONARA_AUTHORIZER_SIGNING_KEY
+wrangler secret put SUI_PRIVATE_KEY
 bun run deploy --config /path/to/environment
 ```
 
 The deploy command validates the unified configuration and complete policy set
-before generating temporary Wrangler artifacts. It also derives locally
-available signing-key identities and checks them against the public identities
-pinned in policy.
+before generating temporary Wrangler artifacts. The sponsor address and dynamic
+authorization identity are both derived from `SUI_PRIVATE_KEY` at runtime.
 
 ## HTTP surface
 

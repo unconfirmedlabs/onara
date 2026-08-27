@@ -30,8 +30,6 @@ function requirement(name = 'sender-ok') {
       kind: 'dynamic-authorization',
       url: 'https://example.com/authorize',
       audience: 'test-authorizer',
-      signingKeyEnv: 'TEST_ONARA_SIGNING_KEY',
-      signingIdentity: IDENTITY,
     },
   }
 }
@@ -301,7 +299,7 @@ describe('schema-v1 compilation', () => {
     ).not.toThrow()
   })
 
-  test('dynamic authorization checks require canonical trust data and fail-closed URL defaults', () => {
+  test('dynamic authorization checks reject legacy signing fields and fail-closed URL defaults', () => {
     const compiled = loadPolicies([
       requirement(),
       allow({ requires: ['sender-ok'] }),
@@ -311,9 +309,9 @@ describe('schema-v1 compilation', () => {
 
     for (const check of [
       { ...requirement().check, kind: 'sender.dynamic' },
-      { ...requirement().check, signingIdentity: '0x1' },
+      { ...requirement().check, signingIdentity: IDENTITY },
       { ...requirement().check, audience: 'bad\naudience' },
-      { ...requirement().check, signingKeyEnv: 'bad-name' },
+      { ...requirement().check, signingKeyEnv: 'OLD_SIGNING_KEY' },
       { ...requirement().check, url: 'http://example.com/auth' },
       { ...requirement().check, cacheTtlSeconds: 30 },
     ]) {

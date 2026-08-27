@@ -22,10 +22,6 @@ export type DynamicAuthorizationCheck = {
   kind: 'dynamic-authorization'
   url: string
   audience: string
-  /** Name of the Worker secret containing the dedicated Bech32 signing key. */
-  signingKeyEnv: string
-  /** Canonical Sui address derived from the configured signing key. */
-  signingIdentity: string
   timeoutMs?: number
   /** Zero disables caching. Positive values must satisfy the server's KV TTL. */
   cacheTtlSeconds?: number

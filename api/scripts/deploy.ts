@@ -9,8 +9,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
-import { loadPolicies, type CompiledPolicies } from '../src/policy'
-import { parseDynamicAuthorizationSigningKey } from '../src/dynamic-authorization'
+import { loadPolicies } from '../src/policy'
 import sponsorPoliciesConfig from '../policies'
 import {
   generatePoliciesIndex,
@@ -23,7 +22,6 @@ const POLICIES_INDEX = join(API_DIR, 'policies', 'index.ts')
 
 type ExternalDeployment = {
   policies: unknown[]
-  compiledPolicies: CompiledPolicies
   wranglerConfig: string
   generatedWrangler: string | null
   dynamicAuthorizationRequirementNames: string[]
@@ -129,7 +127,6 @@ async function loadExternalDeployment(
       )
       return {
         policies: deployment.policies,
-        compiledPolicies: deployment.compiledPolicies,
         wranglerConfig: '',
         generatedWrangler: generateWranglerConfig(deployment.wrangler),
         dynamicAuthorizationRequirementNames:
@@ -150,71 +147,12 @@ async function loadExternalDeployment(
   )
   return {
     policies,
-    compiledPolicies,
     wranglerConfig,
     generatedWrangler: null,
     dynamicAuthorizationRequirementNames: compiledPolicies.require
       .filter((requirement) => requirement.enabled)
       .map((requirement) => requirement.name),
     source: 'legacy',
-  }
-}
-
-function preflightDynamicAuthorizationSigningKeys(
-  policies: CompiledPolicies,
-  envVars: Record<string, string>,
-): void {
-  const keyPolicies = new Map<
-    string,
-    { identity: string; policies: string[] }
-  >()
-  for (const requirement of policies.require) {
-    if (!requirement.enabled) continue
-    const check = requirement.check
-    const existing = keyPolicies.get(check.signingKeyEnv)
-    if (existing && existing.identity !== check.signingIdentity) {
-      throw new Error(
-        `${check.signingKeyEnv} is configured with multiple public identities.`,
-      )
-    }
-    const entry = existing ?? {
-      identity: check.signingIdentity,
-      policies: [],
-    }
-    const consumers = policies.allow
-      .filter(
-        (policy) =>
-          policy.enabled && policy.requirementNames.includes(requirement.name),
-      )
-      .map((policy) => policy.name)
-    entry.policies.push(
-      ...consumers.map((policy) => `${requirement.name} -> ${policy}`),
-    )
-    keyPolicies.set(check.signingKeyEnv, entry)
-  }
-
-  for (const [envName, { identity, policies: policyNames }] of keyPolicies) {
-    const value = envVars[envName]
-    if (value === undefined) {
-      // Cloudflare secret values are intentionally unreadable. Runtime still
-      // derives and pins the identity before any cache lookup or HTTP request.
-      console.warn(
-        `Could not validate ${envName} locally (expected ${identity}; used by ${policyNames.join(', ')}). ` +
-          'Ensure the Worker secret contains the matching Bech32 suiprivkey.',
-      )
-      continue
-    }
-
-    const keypair = parseDynamicAuthorizationSigningKey(value)
-    const derivedIdentity = keypair.toSuiAddress()
-    if (derivedIdentity !== identity) {
-      throw new Error(
-        `${envName} derives ${derivedIdentity}, but deployment config pins ${identity}.`,
-      )
-    }
-    console.log(
-      `Validated ${envName} (${keypair.getKeyScheme()}, ${derivedIdentity}) for ${policyNames.join(', ')}`,
-    )
   }
 }
 
@@ -242,8 +180,7 @@ async function main() {
 
   if (!configDir) {
     console.log(`${dryRun ? 'Validating' : 'Deploying'} with in-tree config...`)
-    const compiled = loadPolicies(sponsorPoliciesConfig)
-    preflightDynamicAuthorizationSigningKeys(compiled, loadEnvFile(API_DIR))
+    loadPolicies(sponsorPoliciesConfig)
     const args = ['wrangler', 'deploy', '--minify']
     if (dryRun) args.push('--dry-run')
     await run('npx', args, API_DIR)
@@ -255,7 +192,6 @@ async function main() {
   )
   const deployment = await loadExternalDeployment(configDir)
   const envVars = loadEnvFile(configDir)
-  preflightDynamicAuthorizationSigningKeys(deployment.compiledPolicies, envVars)
   const authorizationNames = deployment.dynamicAuthorizationRequirementNames
   if (authorizationNames.length > 0) {
     console.log(

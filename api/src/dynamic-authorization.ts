@@ -7,14 +7,10 @@
 // MUST compare it with both X-Onara-Identity and an independently configured
 // trusted identity. A caller-provided identity is never a trust root.
 //
-// Design: fail closed. Any ambiguity (missing/malformed key, signing failure,
-// network error, timeout, redirect, unexpected status) is "unavailable",
-// never "allow".
+// Design: fail closed. Any ambiguity (signing failure, network error, timeout,
+// redirect, or unexpected status) is "unavailable", never "allow".
 
-import { decodeSuiPrivateKey, type Keypair } from '@mysten/sui/cryptography'
-import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
-import { Secp256k1Keypair } from '@mysten/sui/keypairs/secp256k1'
-import { Secp256r1Keypair } from '@mysten/sui/keypairs/secp256r1'
+import type { Keypair } from '@mysten/sui/cryptography'
 import { isValidSuiAddress, normalizeSuiAddress } from '@mysten/sui/utils'
 import { verifyPersonalMessageSignature } from '@mysten/sui/verify'
 import type { DynamicAuthorizationCheck } from './policy'
@@ -62,7 +58,7 @@ const cacheKey = ({
   requirementName,
   policyName,
   sender,
-  signingIdentity,
+  identity,
 }: {
   audience: string
   url: string
@@ -70,7 +66,7 @@ const cacheKey = ({
   requirementName: string
   policyName: string
   sender: string
-  signingIdentity: string
+  identity: string
 }) =>
   [
     'dynamic-authorization',
@@ -81,7 +77,7 @@ const cacheKey = ({
     requirementName,
     policyName,
     sender,
-    signingIdentity,
+    identity,
   ]
     .map(encodeURIComponent)
     .join(':')
@@ -140,23 +136,6 @@ export function buildDynamicAuthorizationRequestMessage(
       `request-id:${fields.requestId}\n` +
       `method:${DYNAMIC_AUTHORIZATION_REQUEST_METHOD}`,
   )
-}
-
-/** Parse a Bech32 `suiprivkey...` into one of the SDK's software keypairs. */
-export function parseDynamicAuthorizationSigningKey(value: string): Keypair {
-  const parsed = decodeSuiPrivateKey(value)
-  switch (parsed.scheme) {
-    case 'ED25519':
-      return Ed25519Keypair.fromSecretKey(parsed.secretKey)
-    case 'Secp256k1':
-      return Secp256k1Keypair.fromSecretKey(parsed.secretKey)
-    case 'Secp256r1':
-      return Secp256r1Keypair.fromSecretKey(parsed.secretKey)
-    default:
-      throw new Error(
-        `Unsupported dynamic authorization signing key scheme: ${parsed.scheme}`,
-      )
-  }
 }
 
 /**
@@ -280,9 +259,9 @@ export async function verifyDynamicAuthorizationRequest({
  *
  * Resolves on allow (204, or a cache hit). Throws
  * `DynamicAuthorizationDeniedError` on an explicit 403, or
- * `DynamicAuthorizationUnavailableError` for everything else (missing or
- * malformed key, signing failure, timeout, redirect, network error, or an
- * unexpected status). The caller must treat both as "do not sponsor".
+ * `DynamicAuthorizationUnavailableError` for everything else (signing
+ * failure, timeout, redirect, network error, or an unexpected status). The
+ * caller must treat both as "do not sponsor".
  */
 export async function checkDynamicAuthorization({
   check,
@@ -290,7 +269,7 @@ export async function checkDynamicAuthorization({
   policyName,
   sender,
   network,
-  env,
+  signingKey,
   cache,
   fetchImpl = fetch,
   now = () => Date.now(),
@@ -301,36 +280,18 @@ export async function checkDynamicAuthorization({
   policyName: string
   sender: string
   network: string
-  env: Record<string, unknown>
+  signingKey: Keypair
   cache?: DynamicAuthorizationCache
   fetchImpl?: typeof fetch
   now?: () => number
   requestId?: () => string
 }): Promise<void> {
-  const privateKey = env[check.signingKeyEnv]
-  if (typeof privateKey !== 'string' || privateKey.length === 0) {
-    throw new DynamicAuthorizationUnavailableError(
-      `Dynamic authorization signing key env var "${check.signingKeyEnv}" is missing or empty.`,
-    )
-  }
-
-  let signingKey: Keypair
+  let identity: string
   try {
-    signingKey = parseDynamicAuthorizationSigningKey(privateKey)
+    identity = normalizeSuiAddress(signingKey.toSuiAddress())
   } catch {
     throw new DynamicAuthorizationUnavailableError(
-      `Dynamic authorization signing key env var "${check.signingKeyEnv}" is malformed or unsupported.`,
-    )
-  }
-
-  const derivedIdentity = normalizeSuiAddress(signingKey.toSuiAddress())
-  if (
-    !isValidSuiAddress(check.signingIdentity) ||
-    check.signingIdentity !== normalizeSuiAddress(check.signingIdentity) ||
-    derivedIdentity !== check.signingIdentity
-  ) {
-    throw new DynamicAuthorizationUnavailableError(
-      `Dynamic authorization signing key env var "${check.signingKeyEnv}" does not match its configured public identity.`,
+      'Unable to derive the dynamic authorization signing identity.',
     )
   }
 
@@ -365,7 +326,7 @@ export async function checkDynamicAuthorization({
     requirementName,
     policyName,
     sender: normalizedSender,
-    signingIdentity: check.signingIdentity,
+    identity,
   })
   const useCache = check.cacheTtlSeconds > 0 && cache !== undefined
   if (useCache) {

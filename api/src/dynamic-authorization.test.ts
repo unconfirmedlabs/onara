@@ -8,7 +8,6 @@ import {
   checkDynamicAuthorization,
   DynamicAuthorizationDeniedError,
   DynamicAuthorizationUnavailableError,
-  parseDynamicAuthorizationSigningKey,
   signDynamicAuthorizationRequest,
   verifyDynamicAuthorizationRequest,
   type DynamicAuthorizationRequestFields,
@@ -36,14 +35,14 @@ function expectedCacheKey({
   network = NETWORK,
   requirementName = REQUIREMENT,
   policyName = POLICY,
-  signingIdentity = FIXTURE_IDENTITY,
+  identity = FIXTURE_IDENTITY,
 }: {
   audience?: string
   url?: string
   network?: string
   requirementName?: string
   policyName?: string
-  signingIdentity?: string
+  identity?: string
 } = {}): string {
   return [
     'dynamic-authorization',
@@ -54,7 +53,7 @@ function expectedCacheKey({
     requirementName,
     policyName,
     SENDER,
-    signingIdentity,
+    identity,
   ]
     .map(encodeURIComponent)
     .join(':')
@@ -92,19 +91,10 @@ function config(
     kind: 'dynamic-authorization',
     url: URL,
     audience: AUDIENCE,
-    signingKeyEnv: 'MISO_ONARA_SIGNING_KEY',
-    signingIdentity: IDENTITY,
     timeoutMs: 1500,
     cacheTtlSeconds: 0,
     ...overrides,
   }
-}
-
-function env(
-  key: string | null = PRIVATE_KEY,
-  name = 'MISO_ONARA_SIGNING_KEY',
-): Record<string, string> {
-  return key === null ? {} : { [name]: key }
 }
 
 function memoryCache(): DynamicAuthorizationCache & {
@@ -177,21 +167,28 @@ describe('canonical Sui personal-message protocol', () => {
     ).resolves.toBe(true)
   })
 
-  test('parses all supported Bech32 software key schemes', () => {
+  test('signs and verifies with all supported software key schemes', async () => {
     const keypairs = [
       KEYPAIR,
       Secp256k1Keypair.fromSecretKey(new Uint8Array(32).fill(3)),
       Secp256r1Keypair.fromSecretKey(new Uint8Array(32).fill(4)),
     ]
     for (const keypair of keypairs) {
-      const parsed = parseDynamicAuthorizationSigningKey(keypair.getSecretKey())
-      expect(parsed.getKeyScheme()).toBe(keypair.getKeyScheme())
-      expect(parsed.toSuiAddress()).toBe(keypair.toSuiAddress())
+      const signed = await signDynamicAuthorizationRequest({
+        signingKey: keypair,
+        ...fields(),
+      })
+      await expect(
+        verifyDynamicAuthorizationRequest(
+          verifierInput(signed, {
+            trustedIdentities: [keypair.toSuiAddress()],
+          }),
+        ),
+      ).resolves.toBe(true)
     }
   })
 
-  test('rejects malformed keys, fields, and ambiguous line values', () => {
-    expect(() => parseDynamicAuthorizationSigningKey('not-a-key')).toThrow()
+  test('rejects malformed fields and ambiguous line values', () => {
     expect(() =>
       buildDynamicAuthorizationRequestMessage(fields({ audience: 'miso\nevil' })),
     ).toThrow(/visible ASCII/)
@@ -332,7 +329,7 @@ describe('checkDynamicAuthorization', () => {
     policyName: POLICY,
     sender: SENDER,
     network: NETWORK,
-    env: env(),
+    signingKey: KEYPAIR,
     now: FIXED_NOW,
     requestId: () => REQUEST_ID,
   })
@@ -467,51 +464,6 @@ describe('checkDynamicAuthorization', () => {
     ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
   })
 
-  test('fails closed before fetch for missing, empty, or malformed signing keys', async () => {
-    let calls = 0
-    const fetchImpl = (async () => {
-      calls++
-      return new Response(null, { status: 204 })
-    }) as unknown as typeof fetch
-
-    for (const badEnv of [env(null), env(''), env('not-a-private-key')]) {
-      await expect(
-        checkDynamicAuthorization({ ...baseArgs(), env: badEnv, fetchImpl }),
-      ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
-    }
-    expect(calls).toBe(0)
-  })
-
-  test('fails closed before cache or fetch when the key does not match the pinned identity', async () => {
-    let cacheReads = 0
-    let fetchCalls = 0
-    const cache: DynamicAuthorizationCache = {
-      async get() {
-        cacheReads++
-        return '1'
-      },
-      async put() {},
-    }
-    const fetchImpl = (async () => {
-      fetchCalls++
-      return new Response(null, { status: 204 })
-    }) as unknown as typeof fetch
-
-    await expect(
-      checkDynamicAuthorization({
-        ...baseArgs(),
-        check: config({
-          signingIdentity: ATTACKER_KEYPAIR.toSuiAddress(),
-          cacheTtlSeconds: 60,
-        }),
-        cache,
-        fetchImpl,
-      }),
-    ).rejects.toBeInstanceOf(DynamicAuthorizationUnavailableError)
-    expect(cacheReads).toBe(0)
-    expect(fetchCalls).toBe(0)
-  })
-
   test('fails closed for malformed sender, network, or request IDs before fetch', async () => {
     let calls = 0
     const fetchImpl = (async () => {
@@ -601,7 +553,7 @@ describe('checkDynamicAuthorization', () => {
     }
   })
 
-  test('allows distinct endpoints and policies to select distinct signing keys', async () => {
+  test('uses the sponsor signing identity across endpoints and policies', async () => {
     const identities: string[] = []
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       identities.push(new Request(input as RequestInfo, init).headers.get('X-Onara-Identity')!)
@@ -614,15 +566,12 @@ describe('checkDynamicAuthorization', () => {
       check: config({
         url: 'https://other.example/authorize',
         audience: 'other-authorizer',
-        signingKeyEnv: 'OTHER_SIGNING_KEY',
-        signingIdentity: ATTACKER_KEYPAIR.toSuiAddress(),
       }),
       requirementName: 'other-requirement',
       policyName: 'other-policy',
-      env: env(ATTACKER_KEYPAIR.getSecretKey(), 'OTHER_SIGNING_KEY'),
       fetchImpl,
     })
-    expect(identities).toEqual([IDENTITY, ATTACKER_KEYPAIR.toSuiAddress()])
+    expect(identities).toEqual([IDENTITY, IDENTITY])
   })
 
   test('cache hit skips fetch and only 204 allows are cached with the TTL', async () => {
@@ -732,12 +681,7 @@ describe('checkDynamicAuthorization', () => {
         }),
       },
       {
-        check: config({
-          signingIdentity: ATTACKER_KEYPAIR.toSuiAddress(),
-          signingKeyEnv: 'OTHER_SIGNING_KEY',
-          cacheTtlSeconds: 60,
-        }),
-        env: env(ATTACKER_KEYPAIR.getSecretKey(), 'OTHER_SIGNING_KEY'),
+        signingKey: ATTACKER_KEYPAIR,
       },
     ]) {
       let calls = 0

@@ -49,8 +49,6 @@ describe('policies()', () => {
           kind: 'dynamic-authorization',
           url: 'https://api.example.com/v1/onara/authorize',
           audience: 'example-onara-authorization',
-          signingKeyEnv: 'ONARA_SIGNING_KEY',
-          signingIdentity: `0x${'1'.repeat(64)}`,
           timeoutMs: 1_500,
           cacheTtlSeconds: 0,
         },

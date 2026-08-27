@@ -28,8 +28,7 @@ bun run deploy
 |---|---|
 | `SUI_NETWORK` | Network identifier (e.g. `testnet`, `mainnet`) |
 | `SUI_GRPC_URL` | Sui gRPC endpoint URL |
-| `SUI_MNEMONIC` | BIP-39 mnemonic for the sponsor keypair |
-| Requirement-selected signing keys | Each `require.check.signingKeyEnv` names a Worker secret containing a Bech32 `suiprivkey...`. Use a dedicated request-signing key rather than the sponsor mnemonic/key. |
+| `SUI_PRIVATE_KEY` | Bech32 `suiprivkey...` for the sponsor keypair. The same key signs sponsored transactions and dynamic authorization requests. |
 | `DRY_RUN_ONLY` | When set, `/sponsor` always returns dry-run results |
 | `EXECUTION_TIMEOUT_MS` | Max execution time in ms (default: `30000`) |
 | `GAS_BUDGET_MAX` | Optional. Hard server-side cap on gas budget, as a decimal string in MIST (e.g. `"50000000000"`). Enforced before policy matching on both `/sponsor` and `/sponsor/ws` — independent of any per-policy `gasBudgetMax`, which only soft-skips a policy. |
@@ -87,7 +86,7 @@ Deploy with the built-in `allow-all` policy and the in-tree `wrangler.jsonc`:
 
 ```bash
 bun install
-wrangler secret put SUI_MNEMONIC
+wrangler secret put SUI_PRIVATE_KEY
 bun run deploy
 ```
 
@@ -117,8 +116,6 @@ policy array:
         "kind": "dynamic-authorization",
         "url": "https://api.example.com/v1/onara/authorize",
         "audience": "example-onara-authorization",
-        "signingKeyEnv": "EXAMPLE_ONARA_SIGNING_KEY",
-        "signingIdentity": "0x<canonical-public-address>",
         "timeoutMs": 1500,
         "cacheTtlSeconds": 0
       }
@@ -145,9 +142,8 @@ policy array:
 
 `config.json` has exactly `version`, `wrangler`, and `policies`; named
 requirements and concrete allow branches share one flat policy array. Private
-keys never belong in this file. `signingKeyEnv` is only the name of a separately
-provisioned Worker secret, while `signingIdentity` is its safe-to-publish
-expected Sui address.
+keys never belong in this file. Provision the sponsor's Bech32 private key as
+the `SUI_PRIVATE_KEY` Worker secret; Onara derives its public address.
 
 Deploy with the `--config` flag:
 
@@ -161,15 +157,10 @@ Wrangler. It generates temporary Wrangler/policy files and restores/removes
 them on every exit. The older `<config>/wrangler.jsonc` plus
 `<config>/policies/*.json` layout remains supported for migration, but new
 deployments should use unified `config.json`.
-For each dynamic authorization signing key found in a local `.env`, deploy preflight
-also parses the Bech32 key, derives its address, and requires it to equal the
-policy's `signingIdentity`; logs contain only the scheme/address. Cloudflare
-does not expose existing remote secret values, so a missing local value warns.
-Runtime repeats the identity check before any cache read or authorizer request.
 
 For a staged rollout, disable both the requirement and any allow branches that
-will reference it. `signingIdentity` remains a canonical public Sui address
-even while disabled; placeholder private-key or identity values are rejected.
+will reference it. Unknown or legacy signing fields are rejected even while a
+requirement is disabled.
 
 ### Updating
 
@@ -350,8 +341,6 @@ clauses are rejected at load time.
     "kind": "dynamic-authorization",
     "url": "https://issuer.example.com/onara/authorize",
     "audience": "issuer-onara-authorization",
-    "signingKeyEnv": "ISSUER_ONARA_SIGNING_KEY",
-    "signingIdentity": "0x<64-lowercase-hex>",
     "timeoutMs": 1500,
     "cacheTtlSeconds": 0
   }
@@ -475,8 +464,6 @@ authorization for one branch cannot be replayed as another:
 |---|---|---|---|
 | `url` | `string` | — | Endpoint to call. Must be `https://`, except `http://localhost` / `http://127.0.0.1` for local development. |
 | `audience` | `string` | — | Required endpoint/trust-domain identifier included in the signed payload. The receiver must independently pin the same value. Use different audiences for endpoints that must not accept one another's requests. Visible ASCII only. |
-| `signingKeyEnv` | `string` | — | Required name of a Worker secret containing a Bech32 `suiprivkey...`. Each policy/endpoint can select a different key; raw private keys are rejected in policy JSON. |
-| `signingIdentity` | `string` | — | Required canonical Sui address expected from `signingKeyEnv`. The derived runtime identity must match before cache lookup or HTTP. |
 | `timeoutMs` | `number` | `1500` | Request timeout in milliseconds. |
 | `cacheTtlSeconds` | `number` | `0` | If `> 0`, cache an **allow** decision for the complete trust tuple (including requirement and concrete allow policy) for this many seconds. Must be `0` or `>= 60`. |
 
@@ -492,7 +479,7 @@ X-Onara-Policy: <concrete allow policy>
 X-Onara-Network: <SUI_NETWORK>
 X-Onara-Timestamp: <unix seconds>
 X-Onara-Request-Id: <lowercase UUID v4>
-X-Onara-Identity: <normalized Sui address of the signing key>
+X-Onara-Identity: <normalized sponsor address derived from SUI_PRIVATE_KEY>
 X-Onara-Signature: <serialized Sui personal-message signature>
 User-Agent: onara
 ```
@@ -514,9 +501,8 @@ method:GET
 
 Audience, requirement, policy, and network values must contain only visible ASCII, may
 contain interior spaces, and may not have leading/trailing whitespace. Policy
-config is validated at load/deploy time; a malformed runtime network, missing
-key, malformed key, key/address mismatch, or signing error makes the authorizer
-unavailable and can never produce an allow.
+config is validated at load/deploy time; a malformed runtime network or signing
+error makes the authorizer unavailable and can never produce an allow.
 
 The sender is always the address parsed and verified from the transaction
 bytes, normalized to lowercase `0x` + 64 hex digits — **not** the raw
@@ -608,24 +594,21 @@ app.get('/onara/authorize', async (c) => {
 })
 ```
 
-Set each caller key with `wrangler secret put <signingKeyEnv>`. Use a dedicated
-request-signing identity rather than reusing the sponsor gas key. To rotate,
-configure receivers to trust old and new signer addresses, update Onara's
-secret, then remove the old receiver trust after the maximum timestamp window
-and any allow-cache TTL have elapsed. Multiple requirements in the same deliberate
-trust domain may explicitly reuse a key, but separate operators/endpoints
-should use separate key envs and audiences.
+Dynamic authorization uses the same sponsor key as transaction signing. The
+identity in each request is therefore the sponsor address returned by
+`/status`. To rotate `SUI_PRIVATE_KEY`, first configure receivers to trust both
+the old and new sponsor addresses, rotate the key and gas balance, then remove
+the old trust after the maximum timestamp window and allow-cache TTL have
+elapsed.
 
 Bind a KV namespace as `DYNAMIC_AUTHORIZATION_CACHE` if any requirement sets
 `cacheTtlSeconds > 0` — see `wrangler.example.jsonc`.
 
-**Migration from HMAC.** The old `secretEnv` field and implicit
-`DYNAMIC_SENDERS_SECRET` default are rejected. Replace them with explicit
-`audience`, `signingKeyEnv`, and `signingIdentity` fields, provision a Bech32
-Sui private key on Onara, and configure the receiver with the corresponding
-trusted Sui address.
-There is no automatic fallback to HMAC because an ambiguous or partially
-migrated auth mode must fail closed.
+**Signing migration.** The legacy `secretEnv`, `signingKeyEnv`, and
+`signingIdentity` fields are rejected. Provision the sponsor key once as
+`SUI_PRIVATE_KEY`, retain the explicit `audience`, and configure the receiver
+to trust the derived sponsor address. There is no automatic fallback to HMAC
+because an ambiguous or partially migrated auth mode must fail closed.
 
 ### Soft skip vs. hard rejection
 
