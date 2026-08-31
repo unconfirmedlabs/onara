@@ -177,13 +177,15 @@ bun run deploy:cloudflare --config /path/to/environment
 
 The Cloudflare deploy command validates the policy configuration before
 generating a temporary Worker policy registry. The Bun adapter is deployed as
-a standard Bun process and can load the same policy file with
+a standard Bun process and requires the same policy file through
 `ONARA_CONFIG_PATH`.
 
 ## HTTP surface
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /livez` | Process liveness; no RPC call |
+| `GET /readyz` | Time-bounded RPC and chain-identity readiness |
 | `GET /status` | Network, chain ID, sponsor address, and sponsor balances |
 | `POST /sponsor` | Validate, simulate, sponsor, and execute a signed transaction |
 | `GET /sponsor/:digest/status` | Recover transaction status after an uncertain confirmation |

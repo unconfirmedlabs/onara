@@ -77,9 +77,9 @@ Returns the server's network, chain identifier, sponsor address, and balances.
 ### Policy configuration types
 
 For local configuration tooling, the SDK exports `PolicyConfig`, a
-discriminated union of reusable `require` policies, absolute `deny` policies,
-and independent `allow` authorization branches. The server intentionally does
-not expose its active policy configuration over HTTP.
+discriminated union of absolute `deny` policies and independent structural
+`allow` branches. The server intentionally does not expose its active policy
+configuration over HTTP.
 
 ```typescript
 import type { PolicyConfig } from '@unconfirmed/onara'
@@ -87,9 +87,9 @@ import type { PolicyConfig } from '@unconfirmed/onara'
 const policies: PolicyConfig[] = [/* local deployment policies */]
 ```
 
-Every allow policy explicitly declares `requires`; `[]` is an intentional
-public branch. Gas budgets are positive decimal strings so they remain
-bigint-safe in JavaScript.
+Gas budgets are positive decimal strings so they remain bigint-safe in
+JavaScript. User authorization and abuse controls belong at the trusted edge
+or proxy in front of the sponsorship service.
 
 Result-flow constraints identify both ends precisely: `from.result` is the
 producer's zero-based result slot, while each `to.argument` is the consumer's

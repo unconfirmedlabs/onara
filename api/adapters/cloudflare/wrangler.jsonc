@@ -5,6 +5,13 @@
   "compatibility_date": "2026-02-26",
   "workers_dev": false,
   "preview_urls": false,
+  // Set these deployment-specific public values. SUI_CHAIN_ID is the immutable
+  // identifier returned by the configured RPC endpoint, not the network label.
+  // "vars": {
+  //   "SUI_NETWORK": "testnet",
+  //   "SUI_GRPC_URL": "https://fullnode.testnet.sui.io:443",
+  //   "SUI_CHAIN_ID": "<expected-chain-identifier>"
+  // },
   // Hard server-side cap on gas budget, in MIST (decimal string). This may be
   // omitted only when every enabled allow policy defines gasBudgetMax.
   // "vars": {

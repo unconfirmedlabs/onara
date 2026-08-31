@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs'
-import sponsorPolicies from '../../../policies'
 import { parseOnaraConfigText } from '../../core/config'
 import {
   createOnaraRuntime,
@@ -21,7 +20,11 @@ export function createBunRuntime(
 }
 
 function loadPolicies(environment: BunAdapterEnvironment): readonly unknown[] {
-  if (!environment.ONARA_CONFIG_PATH) return sponsorPolicies
+  if (!environment.ONARA_CONFIG_PATH) {
+    throw new Error(
+      'ONARA_CONFIG_PATH must be configured for the Bun adapter. Refusing to start with an in-tree policy.',
+    )
+  }
   return parseOnaraConfigText(
     readFileSync(environment.ONARA_CONFIG_PATH, 'utf8'),
   ).policies

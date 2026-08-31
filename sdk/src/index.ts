@@ -5,8 +5,6 @@ export type {
   StatusResponse,
   PolicyConfig,
   PolicyCommandKind,
-  DynamicAuthorizationCheck,
-  RequirePolicyConfig,
   DenyPolicyWhen,
   DenyPolicyConfig,
   PolicyCallCount,

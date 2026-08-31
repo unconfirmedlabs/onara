@@ -4,5 +4,10 @@
   "main": "../../src/adapters/cloudflare/worker.ts",
   "compatibility_date": "2026-02-26",
   "workers_dev": false,
-  "preview_urls": false
+  "preview_urls": false,
+  "vars": {
+    "SUI_NETWORK": "testnet",
+    "SUI_GRPC_URL": "https://fullnode.testnet.sui.io:443",
+    "SUI_CHAIN_ID": "<expected-chain-identifier>"
+  }
 }

@@ -2,9 +2,9 @@
 
 export type StatusResponse = {
   network: string
-  chainId: string | null
+  chainId: string
   address: string
-  balances: { active: string; pending: string } | null
+  balances: { active: string; pending: string }
 }
 
 // ─── Policy Config Types (schema version 1) ──────────────────────────────────
@@ -17,22 +17,6 @@ export type PolicyCommandKind =
   | 'MakeMoveVec'
   | 'Publish'
   | 'Upgrade'
-
-export type DynamicAuthorizationCheck = {
-  kind: 'dynamic-authorization'
-  url: string
-  audience: string
-  timeoutMs?: number
-  /** Zero disables caching. Positive values must satisfy the server's KV TTL. */
-  cacheTtlSeconds?: number
-}
-
-export type RequirePolicyConfig = {
-  type: 'require'
-  name: string
-  enabled?: boolean
-  check: DynamicAuthorizationCheck
-}
 
 export type DenyPolicyWhen =
   | { kind: 'always' }
@@ -95,8 +79,6 @@ export type AllowPolicyConfig = {
   type: 'allow'
   name: string
   enabled?: boolean
-  /** Mandatory. An empty array is an explicit public authorization branch. */
-  requires: string[]
   senders?: string[]
   suinsNames?: string[]
   /** Positive decimal string in MIST. */
@@ -109,7 +91,6 @@ export type AllowPolicyConfig = {
 }
 
 export type PolicyConfig =
-  | RequirePolicyConfig
   | DenyPolicyConfig
   | AllowPolicyConfig
 

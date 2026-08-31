@@ -2,7 +2,10 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { timing, startTime, endTime } from 'hono/timing'
 import { z } from 'zod'
-import type { OnaraRuntime } from '../core/runtime'
+import {
+  assertOnaraRuntimeReady,
+  type OnaraRuntime,
+} from '../core/runtime'
 import {
   SponsorshipFailure,
   sponsorRequest,
@@ -15,6 +18,7 @@ import { isValidSuiAddress } from '@mysten/sui/utils'
 const DEFAULT_EXECUTION_TIMEOUT_MS = 45_000
 const DEFAULT_CONFIRMATION_TIMEOUT_MS = 30_000
 const MAX_CALLER_TIMEOUT_MS = 60_000
+const DEFAULT_READINESS_TIMEOUT_MS = 5_000
 
 const STAGE_LABELS: Record<SponsorshipStage, string> = {
   guard: 'Gas budget cap',
@@ -42,36 +46,59 @@ const sponsorPayloadSchema = z.object({
     .regex(base64Regex, 'Invalid base64 payload.'),
 })
 
-export function createOnaraApp(runtime: OnaraRuntime) {
+export function createOnaraApp(
+  runtime: OnaraRuntime,
+  { readinessTimeoutMs = DEFAULT_READINESS_TIMEOUT_MS }: {
+    readinessTimeoutMs?: number
+  } = {},
+) {
   const app = new Hono()
   app.use(cors())
   app.use(timing())
+
+  app.get('/livez', (c) => c.json({ status: 'live' }))
+
+  app.get('/readyz', async (c) => {
+    try {
+      const chainId = await assertOnaraRuntimeReady(runtime, {
+        signal: AbortSignal.timeout(readinessTimeoutMs),
+      })
+      return c.json({
+        status: 'ready',
+        network: runtime.environment.SUI_NETWORK,
+        chainId,
+      })
+    } catch (error) {
+      logReadinessFailure(error)
+      return c.json({ status: 'not-ready' }, 503)
+    }
+  })
 
   app.get('/status', async (c) => {
     startTime(c, 'init', 'Client & keypair init')
     endTime(c, 'init')
 
-    let chainId: string | null = null
-    let balances: { active: string; pending: string } | null = null
     try {
       startTime(c, 'rpc', 'Chain ID & balance fetch')
-      const [chainResult, balanceResult] = await Promise.all([
-        runtime.client.core.getChainIdentifier(),
-        runtime.client.getBalance({ owner: runtime.sponsorAddress }),
+      const signal = AbortSignal.timeout(readinessTimeoutMs)
+      const [chainId, balanceResult] = await Promise.all([
+        assertOnaraRuntimeReady(runtime, { signal }),
+        runtime.client.getBalance({ owner: runtime.sponsorAddress, signal }),
       ])
       endTime(c, 'rpc')
-      chainId = chainResult.chainIdentifier
-      balances = {
-        active: balanceResult.balance.addressBalance,
-        pending: balanceResult.balance.coinBalance,
-      }
-    } catch {}
-    return c.json({
-      network: runtime.environment.SUI_NETWORK,
-      chainId,
-      address: runtime.sponsorAddress,
-      balances,
-    })
+      return c.json({
+        network: runtime.environment.SUI_NETWORK,
+        chainId,
+        address: runtime.sponsorAddress,
+        balances: {
+          active: balanceResult.balance.addressBalance,
+          pending: balanceResult.balance.coinBalance,
+        },
+      })
+    } catch (error) {
+      logReadinessFailure(error)
+      return c.json({ error: 'Onara is not ready.' }, 503)
+    }
   })
 
   app.get('/sponsor/:digest/status', async (c) => {
@@ -196,6 +223,15 @@ export function createOnaraApp(runtime: OnaraRuntime) {
   })
 
   return app
+}
+
+function logReadinessFailure(error: unknown): void {
+  console.error(
+    JSON.stringify({
+      message: 'Onara readiness check failed.',
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  )
 }
 
 function sponsorshipDependenciesFor(runtime: OnaraRuntime): SponsorshipDependencies {

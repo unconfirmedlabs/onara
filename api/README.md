@@ -31,6 +31,7 @@ bun run deploy:cloudflare
 |---|---|
 | `SUI_NETWORK` | Network identifier (e.g. `testnet`, `mainnet`) |
 | `SUI_GRPC_URL` | Sui gRPC endpoint URL |
+| `SUI_CHAIN_ID` | Expected immutable chain identifier returned by `SUI_GRPC_URL`; startup fails if it differs. |
 | `SUI_PRIVATE_KEY` | Bech32 `suiprivkey...` for the sponsor keypair. |
 | `DRY_RUN_ONLY` | Set to `true` or `1` to force `/sponsor` into validate-only mode |
 | `EXECUTION_TIMEOUT_MS` | Overall preflight-through-submission deadline in ms (default: `45000`) |
@@ -125,19 +126,30 @@ variables and start it on any Bun-capable host:
 ```bash
 SUI_NETWORK=testnet \
 SUI_GRPC_URL=https://fullnode.testnet.sui.io:443 \
+SUI_CHAIN_ID=<chain-identifier-returned-by-that-endpoint> \
 SUI_PRIVATE_KEY=suiprivkey... \
 GAS_BUDGET_MAX=50000000 \
 bun run start:bun
 ```
 
-Set `ONARA_CONFIG_PATH=/path/to/config.json` to load an external policy
-configuration; without it, the adapter uses the in-tree policy registry.
+Set `ONARA_CONFIG_PATH=/path/to/config.json` to load the required external
+policy configuration. The Bun adapter refuses to start without it, so it can
+never silently fall back to the in-tree `allow-all` policy.
 
 ## API
 
+### `GET /livez` and `GET /readyz`
+
+`/livez` returns `200` whenever the HTTP process is running and performs no RPC
+work. `/readyz` verifies the configured chain identifier and reaches the Sui
+RPC with a five-second deadline; it returns `503` while either check fails.
+Use `/readyz` for Fly or other load-balancer health checks.
+
 ### `GET /status`
 
-Returns the network, chain identifier, sponsor address, and balances.
+Returns the network, verified chain identifier, sponsor address, and balances.
+It uses the same five-second bounded readiness check and returns `503` rather
+than reporting stale or incomplete information when the RPC is unavailable.
 
 ```json
 {
