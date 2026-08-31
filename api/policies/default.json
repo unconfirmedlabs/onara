@@ -1,7 +1,6 @@
 {
   "type": "allow",
   "name": "default-coin-zero-flow",
-  "requires": [],
   "commands": {
     "allowed": ["MoveCall"],
     "max": 2

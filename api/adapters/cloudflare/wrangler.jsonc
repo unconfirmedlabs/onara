@@ -1,0 +1,16 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "onara",
+  "main": "../../src/adapters/cloudflare/worker.ts",
+  "compatibility_date": "2026-02-26",
+  "workers_dev": false,
+  "preview_urls": false,
+  // Hard server-side cap on gas budget, in MIST (decimal string). This may be
+  // omitted only when every enabled allow policy defines gasBudgetMax.
+  // "vars": {
+  //   "GAS_BUDGET_MAX": "50000000000"
+  // },
+  // Provision the sponsor's Bech32 `suiprivkey...` separately:
+  //   wrangler secret put SUI_PRIVATE_KEY
+  // Its public address is derived at runtime.
+}

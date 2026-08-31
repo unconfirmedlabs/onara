@@ -12,7 +12,7 @@ type SimulationResult = Awaited<
 /**
  * Immutable, request-scoped facts derived from the exact bytes the sender
  * signed. Data-producing RPC promises are cached for this request; security
- * decisions (signature checks, rate limits, ownership, authorization, signing,
+ * decisions (signature checks, ownership, policy evaluation, signing,
  * and execution) deliberately remain explicit stages in the service.
  */
 export class SponsorshipAnalysis {

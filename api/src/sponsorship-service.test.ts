@@ -16,7 +16,6 @@ const policies = loadPolicies([
   {
     type: 'allow',
     name: 'public',
-    requires: [],
     commands: { allowed: ['MoveCall'] },
     calls: {
       mode: 'set',
@@ -84,7 +83,6 @@ async function fixture({
     client,
     keypair: sponsor,
     sponsorAddress: sponsor.toSuiAddress(),
-    network: 'testnet',
     policies,
     gasBudgetMax: null,
     forceValidateOnly: false,
@@ -99,7 +97,6 @@ async function fixture({
           txBytes: toBase64(bytes),
           txSignature: signature,
         },
-        ip: '127.0.0.1',
         mode,
         waitForExecution: false,
         executionTimeoutMs,
@@ -139,16 +136,14 @@ describe('sponsorRequest', () => {
       'guard:end',
       'signature:start',
       'signature:end',
-      'sender-rate-limit:start',
-      'sender-rate-limit:end',
       'context:start',
       'context:end',
       'policy:start',
       'policy:end',
       'ownership:start',
       'ownership:end',
-      'requirements:start',
-      'requirements:end',
+      'suins:start',
+      'suins:end',
     ])
   })
 
@@ -225,7 +220,6 @@ describe('sponsorRequest', () => {
       {
         type: 'allow',
         name: 'private-policy-name',
-        requires: [],
         commands: { allowed: ['MoveCall'] },
         calls: {
           mode: 'set',
@@ -254,34 +248,19 @@ describe('sponsorRequest', () => {
     }
   })
 
-  test('treats a rate-limit binding outage as unavailable, not invalid input', async () => {
-    const test = await fixture({ mode: 'validate-only' })
-    test.dependencies.ipRateLimit = {
-      limit: async () => {
-        throw new Error('binding unavailable')
-      },
-    }
-
-    await expect(test.run()).rejects.toMatchObject({
-      kind: 'rate-limit-unavailable',
-    })
-  })
-
-  test('a hung SuiNS lookup cannot block a structurally valid public branch', async () => {
+  test('a hung SuiNS lookup cannot block a matching branch without a SuiNS selector', async () => {
     const test = await fixture({ mode: 'validate-only' })
     test.dependencies.policies = loadPolicies([
       {
         type: 'allow',
         name: 'name-gated',
-        requires: [],
         suinsNames: ['*.onara.sui'],
         commands: { allowed: ['MoveCall'] },
         calls: { mode: 'set', rules: [{ id: 'all', targets: ['*'] }] },
       },
       {
         type: 'allow',
-        name: 'public',
-        requires: [],
+        name: 'not-name-gated',
         commands: { allowed: ['MoveCall'] },
         calls: { mode: 'set', rules: [{ id: 'all', targets: ['*'] }] },
       },
@@ -298,7 +277,7 @@ describe('sponsorRequest', () => {
 
     expect(result).toMatchObject({
       kind: 'validated',
-      metadata: { policyName: 'public' },
+      metadata: { policyName: 'not-name-gated' },
     })
     expect(nameCalls).toBe(0)
   })

@@ -3,9 +3,8 @@ import type { SuiGrpcClient } from '@mysten/sui/grpc'
 import { normalizeSuiAddress } from '@mysten/sui/utils'
 import pTimeout, { TimeoutError } from 'p-timeout'
 import {
-  evaluatePolicyRequirements,
+  selectPolicyAllowBranch,
   validateSponsoredTransactionData,
-  type AuthorizationDecision,
   type CompiledPolicies,
   type PolicyEvaluationPlan,
 } from './policy'
@@ -18,21 +17,13 @@ import {
   InvalidSenderSignatureError,
 } from './sender-signature'
 import {
-  checkDynamicAuthorization,
-  DynamicAuthorizationDeniedError,
-  type DynamicAuthorizationCache,
-} from './dynamic-authorization'
-import {
   executeTransaction,
   type ExecutionOutcome,
 } from './execution'
 import {
   assertGasBudgetWithinCap,
-  assertRateLimits,
   GasBudgetExceededError,
-  RateLimitedError,
-  type RateLimitBinding,
-} from './request-guards'
+} from './gas-budget'
 import { SponsorshipAnalysis } from './sponsorship-analysis'
 
 export type SponsorshipMode = 'validate-only' | 'execute'
@@ -40,11 +31,10 @@ export type SponsorshipMode = 'validate-only' | 'execute'
 export type SponsorshipStage =
   | 'guard'
   | 'signature'
-  | 'sender-rate-limit'
   | 'context'
   | 'policy'
   | 'ownership'
-  | 'requirements'
+  | 'suins'
   | 'simulation'
   | 'execution'
 
@@ -56,16 +46,13 @@ export type SponsorshipStageObserver = (
 export type SponsorshipFailureKind =
   | 'invalid-transaction'
   | 'policy-denied'
-  | 'rate-limited'
-  | 'rate-limit-unavailable'
   | 'request-timeout'
   | 'invalid-signature'
   | 'signature-unavailable'
   | 'context-unavailable'
   | 'input-not-authorized'
   | 'input-lookup-unavailable'
-  | 'requirements-denied'
-  | 'requirements-unavailable'
+  | 'suins-unavailable'
   | 'simulation-failed'
   | 'simulation-unavailable'
 
@@ -86,18 +73,14 @@ export function sponsorshipHttpStatus(
   failure: SponsorshipFailure,
 ): 400 | 403 | 429 | 503 | 504 {
   switch (failure.kind) {
-    case 'rate-limited':
-      return 429
     case 'request-timeout':
       return 504
     case 'policy-denied':
-    case 'requirements-denied':
       return 403
     case 'signature-unavailable':
-    case 'rate-limit-unavailable':
     case 'context-unavailable':
     case 'input-lookup-unavailable':
-    case 'requirements-unavailable':
+    case 'suins-unavailable':
     case 'simulation-unavailable':
       return 503
     default:
@@ -113,7 +96,6 @@ export type SponsorshipPayload = {
 
 export type SponsorshipRequest = {
   payload: SponsorshipPayload
-  ip: string
   mode: SponsorshipMode
   waitForExecution: boolean
   executionTimeoutMs: number
@@ -124,13 +106,9 @@ export type SponsorshipDependencies = {
   client: SuiGrpcClient
   keypair: Keypair
   sponsorAddress: string
-  network: string
   policies: CompiledPolicies
   gasBudgetMax: bigint | null
   forceValidateOnly: boolean
-  senderRateLimit?: RateLimitBinding
-  ipRateLimit?: RateLimitBinding
-  dynamicAuthorizationCache?: DynamicAuthorizationCache
 }
 
 export type SponsorshipMetadata = {
@@ -221,56 +199,6 @@ function simulationErrorMessage(error: unknown): string {
   return 'unknown error'
 }
 
-async function evaluateAuthorizationPlan({
-  dependencies,
-  plan,
-  sender,
-  signal,
-  resolveSenderName,
-}: {
-  dependencies: SponsorshipDependencies
-  plan: PolicyEvaluationPlan
-  sender: string
-  signal: AbortSignal
-  resolveSenderName: () => Promise<string | null>
-}): Promise<AuthorizationDecision> {
-  return evaluatePolicyRequirements({
-    allowBranches: plan.allowBranches,
-    resolveSenderName,
-    evaluate: async ({ requirement, policyName }) => {
-      try {
-        await checkDynamicAuthorization({
-          check: requirement.check,
-          requirementName: requirement.name,
-          policyName,
-          sender,
-          network: dependencies.network,
-          signingKey: dependencies.keypair,
-          cache: dependencies.dynamicAuthorizationCache,
-          signal,
-        })
-        return 'allow'
-      } catch (error) {
-        console.error(
-          JSON.stringify({
-            message: 'Policy requirement check failed.',
-            sender,
-            requirement: requirement.name,
-            policy: policyName,
-            error:
-              error instanceof Error
-                ? error.message
-                : 'Dynamic authorization check failed.',
-          }),
-        )
-        return error instanceof DynamicAuthorizationDeniedError
-          ? 'deny'
-          : 'unavailable'
-      }
-    },
-  })
-}
-
 /**
  * One sponsorship pipeline shared by every HTTP execution mode, so dry-run and
  * executable requests cannot reorder or omit security stages.
@@ -293,23 +221,6 @@ export async function sponsorRequest({
   ) => runStage(name, onStage, operation, deadlineAt)
 
   const { analysis, sender } = await stage('guard', async () => {
-    try {
-      await assertRateLimits({
-        ipLimiter: dependencies.ipRateLimit,
-        sender: '',
-        ip: request.ip,
-      })
-    } catch (error) {
-      if (error instanceof RateLimitedError) {
-        throw failure('rate-limited', error.message, error)
-      }
-      throw failure(
-        'rate-limit-unavailable',
-        'Unable to apply IP rate limit.',
-        error,
-      )
-    }
-
     try {
       const analysis = new SponsorshipAnalysis({
         client: dependencies.client,
@@ -357,25 +268,6 @@ export async function sponsorRequest({
       throw failure(
         'signature-unavailable',
         'Unable to verify the sender signature.',
-        error,
-      )
-    }
-  })
-
-  await stage('sender-rate-limit', async () => {
-    try {
-      await assertRateLimits({
-        senderLimiter: dependencies.senderRateLimit,
-        sender,
-        ip: '',
-      })
-    } catch (error) {
-      if (error instanceof RateLimitedError) {
-        throw failure('rate-limited', error.message, error)
-      }
-      throw failure(
-        'rate-limit-unavailable',
-        'Unable to apply sender rate limit.',
         error,
       )
     }
@@ -448,47 +340,31 @@ export async function sponsorRequest({
     }
   })
 
-  const authorization = await stage('requirements', () =>
-    evaluateAuthorizationPlan({
-      dependencies,
-      plan,
-      sender,
-      signal,
-      resolveSenderName: async () => {
-        try {
-          return await analysis.senderName()
-        } catch (error) {
-          console.error(
-            JSON.stringify({
-              message: 'SuiNS policy requirement unavailable.',
-              sender,
-              error: error instanceof Error ? error.message : String(error),
-            }),
-          )
-          throw error
-        }
-      },
+  const selection = await stage('suins', () =>
+    selectPolicyAllowBranch({
+      allowBranches: plan.allowBranches,
+      resolveSenderName: () => analysis.senderName(),
     }),
   )
   if (signal.aborted) {
     throw failure('request-timeout', 'Sponsorship request timed out.')
   }
-  if (authorization.status === 'denied') {
+  if (selection.status === 'denied') {
     throw failure(
-      'requirements-denied',
-      'Transaction policy requirements denied.',
+      'policy-denied',
+      'Transaction is not eligible for sponsorship.',
     )
   }
-  if (authorization.status === 'unavailable') {
+  if (selection.status === 'unavailable') {
     throw failure(
-      'requirements-unavailable',
-      'Transaction policy requirements unavailable.',
+      'suins-unavailable',
+      'Unable to resolve SuiNS policy context.',
     )
   }
 
   const metadata: SponsorshipMetadata = {
     sender,
-    policyName: authorization.policyName,
+    policyName: selection.policyName,
     moveCallTargets: plan.calledTargets,
     gasBudget: analysis.gasBudget,
     moveCallCount: analysis.moveCallCount,

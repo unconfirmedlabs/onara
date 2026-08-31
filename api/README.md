@@ -2,15 +2,18 @@
 
 Sui transaction sponsorship server with a declarative policy engine. Clients submit pre-built, pre-signed transactions; the server validates them against a set of JSON policies and, if approved, co-signs with the sponsor keypair and submits on-chain.
 
-Runs on **Cloudflare Workers**.
+Runs through peer **Cloudflare Workers** and **Bun** adapters.
 
 ## Quick start
 
 ```bash
 bun install
 
-# Local development
-bun run dev
+# Cloudflare Worker development
+bun run dev:cloudflare
+
+# Bun server development
+bun run start:bun
 
 # Run policy tests (offline, no gas costs)
 bun test
@@ -19,7 +22,7 @@ bun test
 bun run typecheck
 
 # Deploy to Cloudflare Workers
-bun run deploy
+bun run deploy:cloudflare
 ```
 
 ### Environment variables
@@ -28,103 +31,49 @@ bun run deploy
 |---|---|
 | `SUI_NETWORK` | Network identifier (e.g. `testnet`, `mainnet`) |
 | `SUI_GRPC_URL` | Sui gRPC endpoint URL |
-| `SUI_PRIVATE_KEY` | Bech32 `suiprivkey...` for the sponsor keypair. The same key signs sponsored transactions and dynamic authorization requests. |
+| `SUI_PRIVATE_KEY` | Bech32 `suiprivkey...` for the sponsor keypair. |
 | `DRY_RUN_ONLY` | Set to `true` or `1` to force `/sponsor` into validate-only mode |
 | `EXECUTION_TIMEOUT_MS` | Overall preflight-through-submission deadline in ms (default: `45000`) |
 | `CONFIRMATION_TIMEOUT_MS` | Max confirmation wait in ms after submission (default: `30000`) |
 | `GAS_BUDGET_MAX` | Hard server-side cap on gas budget, as a decimal string in MIST (e.g. `"50000000"`). It may be omitted only when every enabled allow policy sets `gasBudgetMax`. Enforced before policy matching on `/sponsor`. |
 
-### Cloudflare bindings
+## Adapters
 
-| Binding | Type | Description |
-|---|---|---|
-| `ANALYTICS` | Analytics Engine | Optional. When bound, writes sponsorship analytics per request. |
-| `SENDER_RATE_LIMIT` | Rate Limiting | Optional. When bound, caps requests per sender address. Absent = no per-sender limit. |
-| `IP_RATE_LIMIT` | Rate Limiting | Optional. When bound, caps requests per `cf-connecting-ip`. Absent = no per-IP limit. |
-| `DYNAMIC_AUTHORIZATION_CACHE` | KV Namespace | Optional. Caches allow decisions from `dynamic-authorization` requirement checks that set `cacheTtlSeconds > 0`. Absent = requirement checks are never cached. |
+### Cloudflare Workers
 
-To enable analytics, add the binding in `wrangler.jsonc`:
-
-```jsonc
-"analytics_engine_datasets": [
-  { "binding": "ANALYTICS", "dataset": "sponsorship" }
-]
-```
-
-To enable rate limiting, add the bindings under `unsafe.bindings` in `wrangler.jsonc`
-(the `period` must be `10` or `60` seconds):
-
-```jsonc
-"unsafe": {
-  "bindings": [
-    {
-      "name": "SENDER_RATE_LIMIT",
-      "type": "ratelimit",
-      "namespace_id": "1001",
-      "simple": { "limit": 10, "period": 60 }
-    },
-    {
-      "name": "IP_RATE_LIMIT",
-      "type": "ratelimit",
-      "namespace_id": "1002",
-      "simple": { "limit": 30, "period": 60 }
-    }
-  ]
-}
-```
-
-The IP limit is checked before cryptographic or RPC work. The sender limit is
-checked only after the submitted transaction signature has been verified, so an
-attacker cannot consume another address's quota. Both still run before policy
-matching, simulation, and sponsor signing. Either binding may be omitted
-independently. A request that exceeds either limit is rejected with HTTP `429`.
-
-## Deployment
-
-### Quick deploy (defaults)
-
-Deploy with the built-in `allow-all` policy and the in-tree `wrangler.jsonc`:
+Deploy with the built-in `allow-all` policy and the in-tree
+`adapters/cloudflare/wrangler.jsonc`:
 
 ```bash
 bun install
 wrangler secret put SUI_PRIVATE_KEY
-bun run deploy
+bun run deploy:cloudflare
 ```
+
+The default Worker has no public route and is intended to be called through a
+Cloudflare Service binding. Declare the binding in each calling Worker's
+`wrangler.jsonc`:
+
+```jsonc
+"services": [{ "binding": "ONARA", "service": "onara" }]
+```
+
+Then forward the request with `return env.ONARA.fetch(request)`. If a public
+endpoint is required, add its route in the deployment-specific Wrangler config.
 
 ### Custom config
 
-For production deployments, use one authoritative `<environment>/config.json`
-outside the repo. It contains only public Wrangler settings and the ordered
-policy array:
+For production deployments, keep the host-neutral policy configuration in
+`<environment>/config.json` and Cloudflare settings in the adjacent
+`<environment>/wrangler.jsonc`:
 
 ```jsonc
 {
   "version": 1,
-  "wrangler": {
-    "name": "my-onara-testnet",
-    "main": "src/workers.ts",
-    "compatibility_date": "2026-02-26",
-    "vars": {
-      "SUI_NETWORK": "testnet",
-      "SUI_GRPC_URL": "https://fullnode.testnet.sui.io:443"
-    }
-  },
   "policies": [
-    {
-      "type": "require",
-      "name": "example-sender",
-      "check": {
-        "kind": "dynamic-authorization",
-        "url": "https://api.example.com/v1/onara/authorize",
-        "audience": "example-onara-authorization",
-        "timeoutMs": 1500,
-        "cacheTtlSeconds": 0
-      }
-    },
     {
       "type": "allow",
       "name": "my-app-policy",
-      "requires": ["example-sender"],
       "gasBudgetMax": "1000000000",
       "commands": { "allowed": ["MoveCall"], "max": 1 },
       "calls": {
@@ -141,27 +90,20 @@ policy array:
 }
 ```
 
-`config.json` has exactly `version`, `wrangler`, and `policies`; named
-requirements and concrete allow branches share one flat policy array. Private
-keys never belong in this file. Provision the sponsor's Bech32 private key as
-the `SUI_PRIVATE_KEY` Worker secret; Onara derives its public address.
+`config.json` has exactly `version` and `policies`; concrete deny and allow
+branches share one flat policy array. Private keys never belong
+in this file. Set the common runtime variables in the host environment, and
+provide `SUI_PRIVATE_KEY` as a Worker secret on Cloudflare.
 
 Deploy with the `--config` flag:
 
 ```bash
-bun run deploy --config ~/my-onara-config
+bun run deploy:cloudflare --config ~/my-onara-config
 ```
 
-The deploy script strictly validates the unified envelope, public Wrangler
-settings, and complete policy set before writing generated files or invoking
-Wrangler. It generates temporary Wrangler/policy files and restores/removes
-them on every exit. The older `<config>/wrangler.jsonc` plus
-`<config>/policies/*.json` layout remains supported for migration, but new
-deployments should use unified `config.json`.
-
-For a staged rollout, disable both the requirement and any allow branches that
-will reference it. Unknown or legacy signing fields are rejected even while a
-requirement is disabled.
+The Cloudflare deploy adapter validates the host-neutral policy configuration
+before generating the Worker policy registry, and always restores the in-tree
+registry after invoking Wrangler.
 
 ### Updating
 
@@ -170,10 +112,26 @@ Your config lives outside the repo, so pulling updates is clean:
 ```bash
 git pull
 bun install
-bun run deploy --config ~/my-onara-config
+bun run deploy:cloudflare --config ~/my-onara-config
 ```
 
-No merge conflicts with policies or wrangler config.
+No merge conflicts with policies or host configuration.
+
+### Bun
+
+The Bun adapter is a normal long-running HTTP server. Set the common runtime
+variables and start it on any Bun-capable host:
+
+```bash
+SUI_NETWORK=testnet \
+SUI_GRPC_URL=https://fullnode.testnet.sui.io:443 \
+SUI_PRIVATE_KEY=suiprivkey... \
+GAS_BUDGET_MAX=50000000 \
+bun run start:bun
+```
+
+Set `ONARA_CONFIG_PATH=/path/to/config.json` to load an external policy
+configuration; without it, the adapter uses the in-tree policy registry.
 
 ## API
 
@@ -255,22 +213,14 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 Detailed policy mismatch diagnostics are written to server logs and are not
 included in the HTTP response.
 
-**Error response (429, rate limited):**
-
-```json
-{
-  "error": "Rate limit exceeded for sender 0x...."
-}
-```
-
 ## Policy engine
 
 Policies are JSON files in the `policies/` directory, registered in `policies/index.ts`. The server loads and compiles them at startup.
 
 When a transaction arrives at `/sponsor`, the engine:
 
-1. Rejects requests over the global/per-policy gas ceiling and the per-IP rate limit (when configured)
-2. Verifies the sender's signature over the exact transaction bytes, then applies the sender rate limit
+1. Rejects requests over the global/per-policy gas ceiling.
+2. Verifies the sender's signature over the exact transaction bytes.
 3. Verifies the embedded sender and gas owner match the request and requires an
    empty gas payment (`[]`) so gas comes only from the sponsor address balance
 4. Requires an expiration no later than the next epoch
@@ -280,16 +230,14 @@ When a transaction arrives at `/sponsor`, the engine:
    ORed; configuration order does not lock evaluation to the first candidate.
 8. Resolves every owned-object input over RPC and requires it to be sender-owned
    or immutable.
-9. Evaluates each branch's named requirements with AND semantics. A passing
-   branch authorizes the transaction. If none passes, an unavailable branch
-   produces `503`; otherwise all branches are denied and produce `403`.
+9. Selects a matching structural branch, resolving SuiNS names only when a
+   surviving branch needs one.
 10. For executable requests, simulates the exact sender-signed bytes, sponsor-signs
     once, and submits those same bytes. Validate-only requests stop before all
     three operations.
 
-The algebra is `deny override; OR(allows); AND(requirements)`. An allow with
-`"requires": []` is an explicit public branch. No structural match means deny
-by default.
+The algebra is `deny override; OR(allows)`. No structural match means deny by
+default. User authorization and abuse controls belong at the deployment edge.
 
 ### Sponsor-only-gas invariants
 
@@ -320,11 +268,8 @@ the sponsor pays exclusively from its address balance.
 
 Every entry has an explicit `type` and a unique `name`:
 
-- **`require`** defines a reusable external check. Schema v1 supports
-  `dynamic-authorization`.
 - **`deny`** rejects on `always`, `sender`, or `any-move-call`.
-- **`allow`** defines one concrete structural branch and its mandatory
-  `requires` array.
+- **`allow`** defines one concrete structural branch.
 
 All objects are strict: legacy fields, unknown keys, duplicate names, duplicate
 list members, ambiguous call-rule target ownership, and duplicate result-flow
@@ -341,20 +286,6 @@ clauses are rejected at load time.
 ### Policy schema
 
 ```jsonc
-// Named requirement
-{
-  "type": "require",
-  "name": "trusted-sender",
-  "enabled": true,
-  "check": {
-    "kind": "dynamic-authorization",
-    "url": "https://issuer.example.com/onara/authorize",
-    "audience": "issuer-onara-authorization",
-    "timeoutMs": 1500,
-    "cacheTtlSeconds": 0
-  }
-}
-
 // Deny rule
 {
   "type": "deny",
@@ -371,7 +302,6 @@ clauses are rejected at load time.
   "type": "allow",
   "name": "purchase",
   "enabled": true,
-  "requires": ["trusted-sender"],
   "senders": ["0xALICE"],
   "suinsNames": ["onara.sui", "*.onara.sui"],
   "gasBudgetMax": "50000000000",
@@ -455,169 +385,16 @@ must be one of the declared Move-call top-level arguments. Native consumers
 nested uses are rejected. Duplicate producer clauses and duplicate destinations
 are configuration errors.
 
-### Sender gates and dynamic authorization
+### Sender gates
 
-An allow branch may use `"senders": ["0xALICE", "0xBOB"]` as a synchronous
-static selector. If the sender does not match, that branch is skipped while
-other structural branches remain eligible. A deny-by-sender rule instead uses
+An allow branch may use `"senders": ["0xALICE", "0xBOB"]` as a static
+selector. If the sender does not match, that branch is skipped while other
+structural branches remain eligible. A deny-by-sender rule instead uses
 `{ "kind": "sender", "addresses": [...] }`.
 
-External authorization is a named `require` policy with
-`check.kind: "dynamic-authorization"`. Every enabled allow branch lists its named
-requirements in the mandatory `requires` array. Requirements are ANDed within
-one branch; structurally complete allow branches are ORed. The server signs and
-caches the exact `(requirement name, concrete allow policy name)` tuple, so an
-authorization for one branch cannot be replayed as another:
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `url` | `string` | — | Endpoint to call. Must be `https://`, except `http://localhost` / `http://127.0.0.1` for local development. |
-| `audience` | `string` | — | Required endpoint/trust-domain identifier included in the signed payload. The receiver must independently pin the same value. Use different audiences for endpoints that must not accept one another's requests. Visible ASCII only. |
-| `timeoutMs` | `number` | `1500` | Request timeout in milliseconds. |
-| `cacheTtlSeconds` | `number` | `0` | If `> 0`, cache an **allow** decision for the complete trust tuple (including requirement and concrete allow policy) for this many seconds. Must be `0` or `>= 60`. |
-
-Onara sends a `GET` request authenticated with a Sui personal-message
-signature. The exact headers are:
-
-```
-GET <url>
-X-Onara-Audience: <configured audience>
-X-Onara-Sender: <normalized sender address>
-X-Onara-Requirement: <named requirement>
-X-Onara-Policy: <concrete allow policy>
-X-Onara-Network: <SUI_NETWORK>
-X-Onara-Timestamp: <unix seconds>
-X-Onara-Request-Id: <lowercase UUID v4>
-X-Onara-Identity: <normalized sponsor address derived from SUI_PRIVATE_KEY>
-X-Onara-Signature: <serialized Sui personal-message signature>
-User-Agent: onara
-```
-
-The signed personal-message bytes are the UTF-8 encoding of the following
-canonical payload, in this exact field order, with no trailing newline:
-
-```text
-onara.dynamic-authorization.v1
-audience:<audience>
-sender:<normalized-0x-plus-64-lowercase-hex>
-requirement:<named-requirement>
-policy:<matched-policy-name>
-network:<SUI_NETWORK>
-timestamp:<unix-seconds>
-request-id:<lowercase-uuid-v4>
-method:GET
-```
-
-Audience, requirement, policy, and network values must contain only visible ASCII, may
-contain interior spaces, and may not have leading/trailing whitespace. Policy
-config is validated at load/deploy time; a malformed runtime network or signing
-error makes the authorizer unavailable and can never produce an allow.
-
-The sender is always the address parsed and verified from the transaction
-bytes, normalized to lowercase `0x` + 64 hex digits — **not** the raw
-request field — so your app-side store must normalize addresses the same
-way before comparing.
-
-The receiver must independently configure its expected audience, network,
-allowed requirement/policy tuples, and trusted Onara signer addresses. It must
-verify the personal-message signature and require:
-
-1. the recovered signer address equals `X-Onara-Identity`;
-2. that address is in the receiver's configured trusted-signer set; and
-3. audience, network, requirement, concrete policy, method, and timestamp meet
-   receiver policy.
-
-Never trust an identity merely because it arrived in the request: an attacker
-can sign with their own key and supply their own valid identity. The timestamp
-window limits replay lifetime. `X-Onara-Request-Id` is signed and unique per
-outbound request, but is only correlation data unless the receiver stores
-consumed IDs for at least the accepted timestamp window.
-
-**Deterministic interoperability vector.** This fixture is public test
-material and must never be used in production:
-
-```text
-scheme: ED25519
-private key: suiprivkey1qqqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszasa5uj
-identity: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f
-signature: ALnEwszsGcoTR/PnAU4Aa6auMFYH+/wiy+9z9DCmSoyd9qQGRNHD7OvaEs3sGbS5Dp3ohesqQv2oT2dRYTqnygaKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA==
-```
-
-The signature is over this exact personal-message payload (again, no final
-newline):
-
-```text
-onara.dynamic-authorization.v1
-audience:miso-onara-authorization
-sender:0x0000000000000000000000000000000000000000000000000000000000000001
-requirement:miso-enoki-sender
-policy:miso-sponsored-transactions
-network:testnet
-timestamp:1700000000
-request-id:123e4567-e89b-42d3-a456-426614174000
-method:GET
-```
-
-**Response contract:**
-
-| Status | Meaning |
-|---|---|
-| `204` | Allow. Cached if `cacheTtlSeconds > 0`. |
-| `403` | Requirement is false. Never cached. Other structurally complete allow branches are still evaluated. |
-| Anything else, timeout, or network error | Requirement is unavailable. Never cached. If no branch passes and any branch remains unavailable, the client receives `503`. |
-
-A minimal Hono authorizer endpoint, using Onara's exported reference verifier
-and a KV lookup:
-
-```ts
-app.get('/onara/authorize', async (c) => {
-  const request = {
-    audience: c.req.header('X-Onara-Audience') ?? '',
-    sender: c.req.header('X-Onara-Sender') ?? '',
-    requirementName: c.req.header('X-Onara-Requirement') ?? '',
-    policyName: c.req.header('X-Onara-Policy') ?? '',
-    network: c.req.header('X-Onara-Network') ?? '',
-    timestamp: Number(c.req.header('X-Onara-Timestamp')),
-    requestId: c.req.header('X-Onara-Request-Id') ?? '',
-    identity: c.req.header('X-Onara-Identity') ?? '',
-    signature: c.req.header('X-Onara-Signature') ?? '',
-  }
-
-  // These trust values come from receiver config, not request headers.
-  const ok = await verifyDynamicAuthorizationRequest({
-    ...request,
-    requestMethod: c.req.method,
-    expectedAudience: c.env.ONARA_AUTHORIZATION_AUDIENCE,
-    expectedNetwork: c.env.SUI_NETWORK,
-    allowedRequirementPolicies: {
-      [c.env.ONARA_REQUIREMENT]: c.env.ONARA_ALLOWED_POLICIES.split(','),
-    },
-    trustedIdentities: c.env.ONARA_TRUSTED_SIGNERS.split(','),
-  })
-  if (!ok) return c.body(null, 403)
-
-  const allowed = await c.env.WHITELIST_KV.get(
-    `${request.requirementName}:${request.policyName}:${request.sender}`,
-  )
-  return c.body(null, allowed ? 204 : 403)
-})
-```
-
-Dynamic authorization uses the same sponsor key as transaction signing. The
-identity in each request is therefore the sponsor address returned by
-`/status`. To rotate `SUI_PRIVATE_KEY`, first configure receivers to trust both
-the old and new sponsor addresses, rotate the key and gas balance, then remove
-the old trust after the maximum timestamp window and allow-cache TTL have
-elapsed.
-
-Bind a KV namespace as `DYNAMIC_AUTHORIZATION_CACHE` if any requirement sets
-`cacheTtlSeconds > 0` — see `wrangler.example.jsonc`.
-
-**Signing migration.** The legacy `secretEnv`, `signingKeyEnv`, and
-`signingIdentity` fields are rejected. Provision the sponsor key once as
-`SUI_PRIVATE_KEY`, retain the explicit `audience`, and configure the receiver
-to trust the derived sponsor address. There is no automatic fallback to HMAC
-because an ambiguous or partially migrated auth mode must fail closed.
+User authorization and other dynamic application decisions
+must be enforced by the trusted edge or proxy in front of Onara. Onara should
+not be publicly reachable in a deployment that relies on those controls.
 
 ### Soft skip vs. hard rejection
 
@@ -630,8 +407,7 @@ These conditions cause a policy to be **silently skipped** (the engine moves to 
 
 Structural failures (disallowed target, command limit/kind, call count,
 ordering, sequence, result flow, or type arguments) make that allow branch
-incomplete. Every other structural branch is still considered. Dynamic
-requirements run only for complete branches.
+incomplete. Every other structural branch is still considered.
 
 ### SuiNS name matching
 
@@ -667,9 +443,9 @@ The server retries transient failures on key RPC operations (1 retry, 2 attempts
 - **Transaction execution** — Sui deduplicates by tx digest, safe to retry; the
   sponsor signature is created once and reused across attempts
 
-Preflight RPCs, requirement checks, simulation, sponsor signing, and submission
-share the overall execution deadline (`EXECUTION_TIMEOUT_MS`). Confirmation is
-cancellation-safe and has its own `CONFIRMATION_TIMEOUT_MS` deadline.
+Preflight RPCs, simulation, sponsor signing, and submission share the overall
+execution deadline (`EXECUTION_TIMEOUT_MS`). Confirmation is cancellation-safe
+and has its own `CONFIRMATION_TIMEOUT_MS` deadline.
 
 ## Pre-v1 migration examples
 
@@ -892,58 +668,9 @@ export default sponsorPolicies
 4. Optionally add dedicated tests in `src/policy.test.ts`
 
 Deny policies are always evaluated first regardless of array order. Every
-complete allow branch remains a candidate; named requirements are ANDed within
-each branch and branches are ORed. Configuration order determines only which
-passing concrete policy name is returned when more than one branch passes.
-
-## Analytics
-
-When the `ANALYTICS` binding is configured, the server writes one data point per sponsored transaction to Cloudflare Workers Analytics Engine. Writes are fire-and-forget — they add no latency to the response.
-
-### Data model
-
-Each data point captures:
-
-| Blobs (strings) | Doubles (numbers) |
-|---|---|
-| sender address | success (1.0 / 0.0) |
-| epoch | request count (1.0) |
-| policy name | execution duration (ms) |
-| tx digest | computation cost (MIST) |
-| RPC node | storage cost (MIST) |
-| CF colo | storage rebate (MIST) |
-| country | gas budget (MIST) |
-| city | num move calls |
-| continent | |
-| user agent | |
-
-The sender address is used as the sampling index for accurate per-address analytics at scale.
-
-### Example queries
-
-```sql
--- Total gas sponsored per sender
-SELECT blob1 AS sender,
-       SUM(_sample_interval * (double4 + double5 - double6)) AS total_gas
-FROM sponsorship
-WHERE timestamp >= NOW() - INTERVAL '30' DAY
-GROUP BY blob1 ORDER BY total_gas DESC
-
--- Top countries by request volume
-SELECT blob7 AS country, SUM(_sample_interval * double2) AS requests
-FROM sponsorship
-WHERE timestamp >= NOW() - INTERVAL '7' DAY
-GROUP BY blob7 ORDER BY requests DESC
-
--- Success rate over time
-SELECT intDiv(toUInt32(timestamp), 3600) * 3600 AS hour,
-       SUM(_sample_interval * double1) / SUM(_sample_interval * double2) AS success_rate
-FROM sponsorship
-WHERE timestamp >= NOW() - INTERVAL '24' HOUR
-GROUP BY hour ORDER BY hour
-```
-
-Query via the [Analytics Engine SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/). Data is retained for 3 months.
+complete allow branch remains a candidate and branches are ORed. Configuration
+order determines only which passing concrete policy name is returned when more
+than one branch passes.
 
 ## Testing
 
@@ -956,7 +683,7 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 - Strict flat schema-v1 validation and duplicate/reference rejection
 - Security checks (sender signature, sender/sponsor mismatch, bounded expiration)
 - Sponsor-only-gas checks (empty gas payment, `GasCoin`, sender-scoped withdrawals, owned-input authorization)
-- Server-level gas budget cap and per-sender/per-IP rate limit helpers (`src/request-guards.test.ts`)
+- Server-level gas budget cap helpers (`src/gas-budget.test.ts`)
 - Set mode (target ownership, ranges, `sameAs`, ordering)
 - Wildcards (universal, module, and package level)
 - Sequence mode (rule matching, count enforcement, extra command rejection)
@@ -966,17 +693,21 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 - Deny policies (target deny, sender deny, any-match semantics, order independence)
 - SuiNS name matching (wildcard, exact, DNS RFC 4592, case insensitivity, soft-skip)
 - Soft skip behavior (disabled, sender restriction, SuiNS name, gas budget fallthrough)
-- OR/AND/tri-state requirement algebra and overlapping structural branches
-- Dynamic authorization requirements — exact requirement/policy tuple signing,
-  tamper/cross-domain/replay-window cases, trust pinning, key rotation, response
-  mapping, caching, and redirects (`src/dynamic-authorization.test.ts`)
+- OR branch selection and overlapping structural branches
 - Integration test against the real `policies/default.json`
 
 ## Project structure
 
 ```
 src/
-  app.ts          Hono HTTP server — /status, /sponsor
+  core/
+    config.ts      Host-neutral policy configuration parser
+    runtime.ts     Runtime configuration and shared dependencies
+  http/
+    app.ts         Hono HTTP app factory — /status, /sponsor
+  adapters/
+    bun/           Bun runtime and HTTP server entrypoint
+    cloudflare/    Worker runtime and deploy adapter
   policy.ts       Policy engine — schema, compiler, validator
   policy.test.ts  Offline test suite (bun:test)
   input-authorization.ts       Sender-owned input authorization
@@ -989,15 +720,12 @@ src/
   sponsorship-analysis.test.ts Request-scoped fact caching tests
   sponsorship-service.ts       Sponsorship pipeline shared by execution modes
   sponsorship-service.test.ts  Pipeline ordering and transport mapping tests
-  request-guards.ts            Gas budget cap + rate limit helpers
-  request-guards.test.ts       Request guard tests
-  dynamic-authorization.ts       Dynamic authorization HTTP check, request signing, verification, and caching
-  dynamic-authorization.test.ts  Dynamic authorization protocol and behavior tests
-  workers.ts      Cloudflare Workers entrypoint
+  gas-budget.ts                Server-level gas budget guard
+  gas-budget.test.ts           Gas budget tests
 policies/
   index.ts        Policy registry
   allow-all.json  Default allow-all policy (universal wildcard)
   default.json    Example coin::zero → coin::destroy_zero policy
-scripts/
-  deploy.ts       Deploy script (supports external config directory)
+adapters/
+  cloudflare/     Wrangler configs for the Cloudflare adapter
 ```

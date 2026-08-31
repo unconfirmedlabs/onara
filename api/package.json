@@ -2,15 +2,15 @@
   "name": "@unconfirmed/onara-api",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "bun scripts/deploy.ts",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "dev:cloudflare": "wrangler dev --config adapters/cloudflare/wrangler.jsonc",
+    "start:bun": "bun src/adapters/bun/server.ts",
+    "deploy:cloudflare": "bun src/adapters/cloudflare/deploy.ts",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings --config adapters/cloudflare/wrangler.jsonc",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@mysten/sui": "^2.27.0",
-    "@protobuf-ts/grpcweb-transport": "^2.11.1",
     "envalid": "^8.1.1",
     "hono": "^4.12.3",
     "p-retry": "^7.1.1",

@@ -11,10 +11,9 @@ import {
 //
 //   deny rules override everything
 //   allow branches are ORed
-//   named requirements inside one allow branch are ANDed
 //
-// Transaction structure is evaluated synchronously here. External
-// requirements are returned as an explicit plan and evaluated by the app.
+// Transaction structure is evaluated locally. Authorization and abuse controls
+// belong at the deployment edge, before a request reaches Onara.
 
 const COMMAND_KINDS = [
   'MoveCall',
@@ -59,51 +58,6 @@ const addressSchema = z
     (value) => isValidSuiAddress(normalizeSuiAddress(value)),
     'Expected a valid Sui address.',
   )
-
-const isLocalHostname = (hostname: string): boolean =>
-  hostname === 'localhost' || hostname === '127.0.0.1'
-
-const dynamicAuthorizationCheckSchema = z
-  .object({
-    kind: z.literal('dynamic-authorization'),
-    url: z.string().min(1),
-    audience: namedValueSchema('check.audience'),
-    timeoutMs: z.number().int().positive().default(1500),
-    cacheTtlSeconds: z
-      .number()
-      .int()
-      .nonnegative()
-      .default(0)
-      .refine(
-        (value) => value === 0 || value >= 60,
-        'check.cacheTtlSeconds must be 0 or at least 60.',
-      ),
-  })
-  .strict()
-  .refine((check) => {
-    try {
-      const url = new URL(check.url)
-      return (
-        url.protocol === 'https:' ||
-        (url.protocol === 'http:' && isLocalHostname(url.hostname))
-      )
-    } catch {
-      return false
-    }
-  }, 'check.url must be https:// (http:// is only allowed for localhost/127.0.0.1).')
-
-export type DynamicAuthorizationCheck = z.infer<
-  typeof dynamicAuthorizationCheckSchema
->
-
-const requirePolicySchema = z
-  .object({
-    type: z.literal('require'),
-    name: namedValueSchema('Requirement name'),
-    enabled: z.boolean().default(true),
-    check: dynamicAuthorizationCheckSchema,
-  })
-  .strict()
 
 const denyAlwaysSchema = z.object({ kind: z.literal('always') }).strict()
 const denyMoveCallSchema = z
@@ -217,7 +171,6 @@ const allowPolicySchema = z
     type: z.literal('allow'),
     name: namedValueSchema('Allow policy name'),
     enabled: z.boolean().default(true),
-    requires: uniqueStringsSchema('requires', true),
     senders: z
       .array(addressSchema)
       .min(1)
@@ -245,7 +198,6 @@ const allowPolicySchema = z
   .strict()
 
 const policySchema = z.discriminatedUnion('type', [
-  requirePolicySchema,
   denyPolicySchema,
   allowPolicySchema,
 ])
@@ -372,13 +324,6 @@ type CompiledCalls = {
   resultFlow: CompiledResultFlow[]
 }
 
-export type CompiledRequirement = {
-  type: 'require'
-  name: string
-  enabled: boolean
-  check: DynamicAuthorizationCheck
-}
-
 export type CompiledDenyPolicy = {
   type: 'deny'
   name: string
@@ -393,8 +338,6 @@ export type CompiledAllowPolicy = {
   type: 'allow'
   name: string
   enabled: boolean
-  requirementNames: string[]
-  requirements: CompiledRequirement[]
   senders: Set<string> | null
   suinsNamePatterns: SuinsNamePattern[] | null
   gasBudgetMax: bigint | null
@@ -404,10 +347,8 @@ export type CompiledAllowPolicy = {
 }
 
 export type CompiledPolicies = {
-  require: CompiledRequirement[]
   deny: CompiledDenyPolicy[]
   allow: CompiledAllowPolicy[]
-  requirementsByName: Map<string, CompiledRequirement>
   needsSuinsResolution: boolean
 }
 
@@ -599,15 +540,6 @@ export function loadPolicies(rawConfigs: unknown[]): CompiledPolicies {
   const names = parsed.data.map((policy) => policy.name)
   if (!unique(names)) throw new Error('Duplicate sponsor policy name.')
 
-  const requirements: CompiledRequirement[] = parsed.data
-    .filter((policy): policy is z.infer<typeof requirePolicySchema> =>
-      policy.type === 'require',
-    )
-    .map((policy) => ({ ...policy, type: 'require' as const }))
-  const requirementsByName = new Map(
-    requirements.map((requirement) => [requirement.name, requirement]),
-  )
-
   const deny: CompiledDenyPolicy[] = parsed.data
     .filter((policy): policy is z.infer<typeof denyPolicySchema> =>
       policy.type === 'deny',
@@ -639,37 +571,15 @@ export function loadPolicies(rawConfigs: unknown[]): CompiledPolicies {
       return { type: 'deny' as const, name: policy.name, enabled: policy.enabled, when }
     })
 
-  const referencedRequirements = new Set<string>()
   const allow: CompiledAllowPolicy[] = parsed.data
     .filter((policy): policy is z.infer<typeof allowPolicySchema> =>
       policy.type === 'allow',
     )
     .map((policy) => {
-      const resolved: CompiledRequirement[] = []
-      if (policy.enabled) {
-        for (const name of policy.requires) {
-          const requirement = requirementsByName.get(name)
-          if (!requirement) {
-            throw new Error(
-              `${policy.name}.requires references unknown requirement ${name}.`,
-            )
-          }
-          if (!requirement.enabled) {
-            throw new Error(
-              `${policy.name}.requires references disabled requirement ${name}.`,
-            )
-          }
-          resolved.push(requirement)
-          referencedRequirements.add(name)
-        }
-      }
-
       return {
         type: 'allow' as const,
         name: policy.name,
         enabled: policy.enabled,
-        requirementNames: policy.requires,
-        requirements: resolved,
         senders: policy.senders
           ? new Set(policy.senders.map((address) => normalizeSuiAddress(address)))
           : null,
@@ -685,19 +595,9 @@ export function loadPolicies(rawConfigs: unknown[]): CompiledPolicies {
       }
     })
 
-  for (const requirement of requirements) {
-    if (requirement.enabled && !referencedRequirements.has(requirement.name)) {
-      throw new Error(
-        `Enabled requirement ${requirement.name} is not referenced by an enabled allow policy.`,
-      )
-    }
-  }
-
   return {
-    require: requirements,
     deny,
     allow,
-    requirementsByName,
     needsSuinsResolution: allow.some(
       (policy) => policy.enabled && policy.suinsNamePatterns !== null,
     ),
@@ -1033,7 +933,6 @@ function validateAllowPolicy(
 
 export type PolicyAllowBranch = {
   policyName: string
-  requirements: CompiledRequirement[]
   /** Present only when SuiNS matching was deliberately deferred to evaluation. */
   suinsNamePatterns?: readonly SuinsNamePattern[]
 }
@@ -1197,7 +1096,6 @@ export function validateSponsoredTransactionData({
       validateAllowPolicy(policy, txData.commands, moveCalls)
       allowBranches.push({
         policyName: policy.name,
-        requirements: policy.requirements,
         ...(deferSuinsNameResolution && policy.suinsNamePatterns
           ? { suinsNamePatterns: policy.suinsNamePatterns }
           : {}),
@@ -1244,35 +1142,25 @@ export function validateSponsoredTxPayload({
   })
 }
 
-// ─── Requirement algebra ────────────────────────────────────────────────────
+// ─── Deferred SuiNS branch selection ─────────────────────────────────────────
 
-export type RequirementDecision = 'allow' | 'deny' | 'unavailable'
-
-export type AuthorizationDecision =
+export type PolicyBranchDecision =
   | { status: 'allowed'; policyName: string }
   | { status: 'denied' }
   | { status: 'unavailable' }
 
-export async function evaluatePolicyRequirements({
+export async function selectPolicyAllowBranch({
   allowBranches,
-  evaluate,
   resolveSenderName,
 }: {
   allowBranches: readonly PolicyAllowBranch[]
-  evaluate: (input: {
-    requirement: CompiledRequirement
-    policyName: string
-  }) => Promise<RequirementDecision>
   resolveSenderName?: () => Promise<string | null>
-}): Promise<AuthorizationDecision> {
-  // A complete public branch is already a proof of this OR expression. Resolve
-  // it before any branch-local RPC or external authorization side effect.
-  const publicBranch = allowBranches.find(
-    (branch) =>
-      !branch.suinsNamePatterns && branch.requirements.length === 0,
+}): Promise<PolicyBranchDecision> {
+  const branchWithoutSuinsSelector = allowBranches.find(
+    (branch) => !branch.suinsNamePatterns,
   )
-  if (publicBranch) {
-    return { status: 'allowed', policyName: publicBranch.policyName }
+  if (branchWithoutSuinsSelector) {
+    return { status: 'allowed', policyName: branchWithoutSuinsSelector.policyName }
   }
 
   let sawUnavailable = false
@@ -1292,21 +1180,8 @@ export async function evaluatePolicyRequirements({
         }
       } catch {
         // SuiNS lookup is one conjunct in this branch. Keep evaluating other
-        // requirements because an explicit deny must dominate unavailable.
         branchUnavailable = true
       }
-    }
-
-    for (const requirement of branchDenied ? [] : branch.requirements) {
-      const decision = await evaluate({
-        requirement,
-        policyName: branch.policyName,
-      })
-      if (decision === 'deny') {
-        branchDenied = true
-        break
-      }
-      if (decision === 'unavailable') branchUnavailable = true
     }
 
     if (!branchDenied && !branchUnavailable) {

@@ -3,8 +3,8 @@ import { Transaction, Inputs } from '@mysten/sui/transactions'
 import { toBase64 } from '@mysten/sui/utils'
 import defaultPolicy from '../policies/default.json'
 import {
-  evaluatePolicyRequirements,
   loadPolicies,
+  selectPolicyAllowBranch,
   validateSponsoredTxPayload,
   type CompiledPolicies,
   type PolicyEvaluationPlan,
@@ -20,26 +20,10 @@ const OTHER_PKG =
   '0x0000000000000000000000000000000000000000000000000000000000000def'
 const ZERO_DIGEST = '11111111111111111111111111111111'
 const CHAIN_ID = '69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD'
-const IDENTITY =
-  '0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f'
-
-function requirement(name = 'sender-ok') {
-  return {
-    type: 'require',
-    name,
-    check: {
-      kind: 'dynamic-authorization',
-      url: 'https://example.com/authorize',
-      audience: 'test-authorizer',
-    },
-  }
-}
-
 function allow(overrides: Record<string, unknown> = {}) {
   return {
     type: 'allow',
     name: 'allow',
-    requires: [],
     commands: { allowed: ['MoveCall'] },
     calls: {
       mode: 'set',
@@ -109,12 +93,19 @@ function branchNames(plan: PolicyEvaluationPlan): string[] {
 }
 
 describe('schema-v1 compilation', () => {
-  test('requires flat typed policies and mandatory allow.requires', () => {
+  test('accepts only flat deny and allow policies', () => {
     expect(() => loadPolicies([{ name: 'legacy', targets: ['*'] }])).toThrow()
-    const missingRequires = allow()
-    delete (missingRequires as Record<string, unknown>).requires
-    expect(() => loadPolicies([missingRequires])).toThrow(/requires/)
     expect(() => loadPolicies([allow()])).not.toThrow()
+    expect(() =>
+      loadPolicies([
+        {
+          type: 'require',
+          name: 'external-authorizer',
+          check: {},
+        },
+      ]),
+    ).toThrow()
+    expect(() => loadPolicies([allow({ requires: [] })])).toThrow(/requires/)
   })
 
   test('strictly rejects unknown fields at every policy layer', () => {
@@ -127,10 +118,7 @@ describe('schema-v1 compilation', () => {
           rules: [{ id: 'x', targets: ['*'], extra: true }],
         },
       }),
-      {
-        ...requirement(),
-        check: { ...requirement().check, secretEnv: 'LEGACY_SECRET' },
-      },
+      { type: 'require', name: 'legacy', check: {} },
       { type: 'deny', name: 'd', when: { kind: 'always', targets: ['*'] } },
     ]
     for (const candidate of cases) {
@@ -156,7 +144,6 @@ describe('schema-v1 compilation', () => {
   test('rejects duplicate names, values, rules, normalized values, and flow clauses', () => {
     const duplicateCases = [
       [allow(), allow()],
-      [allow({ requires: ['x', 'x'] })],
       [allow({ commands: { allowed: ['MoveCall', 'MoveCall'] } })],
       [
         allow({
@@ -300,46 +287,6 @@ describe('schema-v1 compilation', () => {
     ).toThrow()
   })
 
-  test('requires enabled requirement references and rejects orphan requirements', () => {
-    expect(() =>
-      loadPolicies([requirement(), allow({ requires: ['missing'] })]),
-    ).toThrow(/unknown requirement/)
-    expect(() =>
-      loadPolicies([
-        { ...requirement(), enabled: false },
-        allow({ requires: ['sender-ok'] }),
-      ]),
-    ).toThrow(/disabled requirement/)
-    expect(() => loadPolicies([requirement(), allow()])).toThrow(/not referenced/)
-    expect(() =>
-      loadPolicies([requirement(), allow({ requires: ['sender-ok'] })]),
-    ).not.toThrow()
-  })
-
-  test('dynamic authorization checks reject legacy signing fields and fail-closed URL defaults', () => {
-    const compiled = loadPolicies([
-      requirement(),
-      allow({ requires: ['sender-ok'] }),
-    ])
-    expect(compiled.require[0]!.check.timeoutMs).toBe(1500)
-    expect(compiled.require[0]!.check.cacheTtlSeconds).toBe(0)
-
-    for (const check of [
-      { ...requirement().check, kind: 'sender.dynamic' },
-      { ...requirement().check, signingIdentity: IDENTITY },
-      { ...requirement().check, audience: 'bad\naudience' },
-      { ...requirement().check, signingKeyEnv: 'OLD_SIGNING_KEY' },
-      { ...requirement().check, url: 'http://example.com/auth' },
-      { ...requirement().check, cacheTtlSeconds: 30 },
-    ]) {
-      expect(() =>
-        loadPolicies([
-          { ...requirement(), check },
-          allow({ requires: ['sender-ok'] }),
-        ]),
-      ).toThrow()
-    }
-  })
 })
 
 describe('global transaction invariants and deny override', () => {
@@ -868,149 +815,63 @@ describe('exact result-flow graph', () => {
   })
 })
 
-describe('allow-branch and requirement truth algebra', () => {
-  function requirementPlan(): PolicyEvaluationPlan {
-    const policies = loadPolicies([
-      requirement('one'),
-      requirement('two'),
-      allow({ name: 'first', requires: ['one', 'two'] }),
-      allow({ name: 'second', requires: ['one'] }),
-    ])
-    return {
-      calledTargets: [],
-      ownedInputIds: [],
-      allowBranches: policies.allow.map((policy) => ({
-        policyName: policy.name,
-        requirements: policy.requirements,
-      })),
-    }
-  }
-
+describe('allow-branch selection', () => {
   test('synchronous validation returns every complete structural allow branch', async () => {
     const policies = loadPolicies([
-      requirement(),
-      allow({ name: 'legacy', requires: ['sender-ok'] }),
-      allow({ name: 'current', requires: ['sender-ok'] }),
+      allow({ name: 'first' }),
+      allow({ name: 'second' }),
     ])
     const txBytes = await buildTxBytes((tx) =>
       tx.moveCall({ target: `${PKG}::mod::fn` }),
     )
-    expect(branchNames(validate(txBytes, policies))).toEqual([
-      'legacy',
-      'current',
-    ])
+    expect(branchNames(validate(txBytes, policies))).toEqual(['first', 'second'])
   })
 
-  test('AND: false dominates unknown within a branch', async () => {
-    const result = await evaluatePolicyRequirements({
-      allowBranches: [requirementPlan().allowBranches[0]!],
-      evaluate: async ({ requirement: item }) =>
-        item.name === 'one' ? 'unavailable' : 'deny',
-    })
-    expect(result).toEqual({ status: 'denied' })
-  })
-
-  test('OR: any passing branch wins over denied or unavailable branches', async () => {
-    const seen: string[] = []
-    const result = await evaluatePolicyRequirements({
-      allowBranches: requirementPlan().allowBranches,
-      evaluate: async ({ requirement: item, policyName }) => {
-        seen.push(`${item.name}:${policyName}`)
-        if (policyName === 'first') return 'unavailable'
-        return 'allow'
-      },
-    })
-    expect(result).toEqual({ status: 'allowed', policyName: 'second' })
-    expect(seen).toEqual(['one:first', 'two:first', 'one:second'])
-  })
-
-  test('OR returns unavailable iff no branch passes and at least one remains unknown', async () => {
-    const result = await evaluatePolicyRequirements({
-      allowBranches: requirementPlan().allowBranches,
-      evaluate: async ({ policyName }) =>
-        policyName === 'first' ? 'unavailable' : 'deny',
-    })
-    expect(result).toEqual({ status: 'unavailable' })
-  })
-
-  test('OR returns denied when every branch is false', async () => {
-    const result = await evaluatePolicyRequirements({
-      allowBranches: requirementPlan().allowBranches,
-      evaluate: async () => 'deny',
-    })
-    expect(result).toEqual({ status: 'denied' })
-  })
-
-  test('an explicit public branch requires no external evaluation', async () => {
-    let calls = 0
-    const result = await evaluatePolicyRequirements({
-      allowBranches: [{ policyName: 'public', requirements: [] }],
-      evaluate: async () => {
-        calls++
-        return 'deny'
-      },
-    })
-    expect(result).toEqual({ status: 'allowed', policyName: 'public' })
-    expect(calls).toBe(0)
-  })
-
-  test('an independent public branch bypasses unnecessary SuiNS work', async () => {
+  test('a branch without a SuiNS selector bypasses unnecessary SuiNS work', async () => {
     let nameCalls = 0
-    const result = await evaluatePolicyRequirements({
+    const result = await selectPolicyAllowBranch({
       allowBranches: [
         {
           policyName: 'name-gated',
-          requirements: [],
           suinsNamePatterns: [{ kind: 'wildcard', suffix: '.onara.sui' }],
         },
-        { policyName: 'public', requirements: [] },
+        { policyName: 'not-name-gated' },
       ],
       resolveSenderName: async () => {
         nameCalls++
         throw new Error('SuiNS unavailable')
       },
-      evaluate: async () => 'allow',
     })
 
-    expect(result).toEqual({ status: 'allowed', policyName: 'public' })
+    expect(result).toEqual({ status: 'allowed', policyName: 'not-name-gated' })
     expect(nameCalls).toBe(0)
   })
 
-  test('a SuiNS outage remains unavailable when no branch can pass', async () => {
-    let nameCalls = 0
-    const result = await evaluatePolicyRequirements({
+  test('a SuiNS outage is unavailable when no branch can pass', async () => {
+    const result = await selectPolicyAllowBranch({
       allowBranches: [
         {
           policyName: 'name-gated',
-          requirements: [],
           suinsNamePatterns: [{ kind: 'wildcard', suffix: '.onara.sui' }],
         },
       ],
       resolveSenderName: async () => {
-        nameCalls++
         throw new Error('SuiNS unavailable')
       },
-      evaluate: async () => 'allow',
     })
 
     expect(result).toEqual({ status: 'unavailable' })
-    expect(nameCalls).toBe(1)
   })
 
-  test('a requirement denial dominates an unavailable SuiNS conjunct', async () => {
-    const requirementItem = requirementPlan().allowBranches[0]!.requirements[0]!
-    const result = await evaluatePolicyRequirements({
+  test('a nonmatching SuiNS name denies the branch', async () => {
+    const result = await selectPolicyAllowBranch({
       allowBranches: [
         {
           policyName: 'name-gated',
-          requirements: [requirementItem],
           suinsNamePatterns: [{ kind: 'exact', name: 'alice.onara.sui' }],
         },
       ],
-      resolveSenderName: async () => {
-        throw new Error('SuiNS unavailable')
-      },
-      evaluate: async () => 'deny',
+      resolveSenderName: async () => 'bob.onara.sui',
     })
 
     expect(result).toEqual({ status: 'denied' })

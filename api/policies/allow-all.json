@@ -1,7 +1,6 @@
 {
   "type": "allow",
   "name": "allow-all",
-  "requires": [],
   "gasBudgetMax": "50000000",
   "commands": {
     "allowed": ["MoveCall"]

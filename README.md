@@ -4,21 +4,18 @@ Policy-enforced gas sponsorship for Sui.
 
 Onara lets an application pay transaction gas without giving up control over
 what it will sponsor. Clients build and sign their own transactions. The Onara
-Worker verifies the sender, gas owner, object ownership, transaction shape, and
-every configured authorization requirement before it adds the sponsor signature
-and submits the transaction to Sui.
+service verifies the sender, gas owner, object ownership, and transaction shape
+before it adds the sponsor signature and submits the transaction to Sui.
 
-- **Declarative policies.** Define reusable requirements, absolute denials, and
-  exact allow branches in one versioned JSON configuration.
+- **Declarative policies.** Define absolute denials and exact allow branches in
+  one versioned JSON configuration.
 - **Fail-closed authorization.** A transaction must satisfy a complete allow
   branch, and any matching deny policy wins.
-- **Sender-aware sponsorship.** Dynamic authorization requirements call an
-  external authorizer with a domain-separated request signed by a dedicated
-  Sui identity.
+- **Clear authorization boundary.** User authorization and abuse controls live
+  at the trusted edge or proxy, outside the sponsorship service.
 - **Sui SDK integration.** Use the published TypeScript client directly or as a
   native Sui client extension.
-- **Cloudflare-native operation.** The server runs on Workers with optional KV,
-  Analytics Engine, and rate-limiting bindings.
+- **Portable server adapters.** Cloudflare Workers and Bun are peer adapters.
 
 Documentation: [unconfirmed.com/projects/onara](https://unconfirmed.com/projects/onara)
 
@@ -26,7 +23,7 @@ Documentation: [unconfirmed.com/projects/onara](https://unconfirmed.com/projects
 
 | Path | Purpose |
 |---|---|
-| [`api/`](./api) | Hono service, schema-v1 policy engine, Cloudflare Worker entry point, deployment tooling, and security tests |
+| [`api/`](./api) | Host-neutral sponsorship service and HTTP app, Cloudflare and Bun adapters, deployment tooling, and security tests |
 | [`sdk/`](./sdk) | Source for the published [`@unconfirmed/onara`](https://www.npmjs.com/package/@unconfirmed/onara) TypeScript package |
 
 Both packages share the root Bun lockfile and are developed in this repository.
@@ -78,27 +75,7 @@ An Onara deployment has one authoritative `config.json`:
 ```jsonc
 {
   "version": 1,
-  "wrangler": {
-    "name": "my-onara-testnet",
-    "main": "src/workers.ts",
-    "compatibility_date": "2026-02-26",
-    "vars": {
-      "SUI_NETWORK": "testnet",
-      "SUI_GRPC_URL": "https://fullnode.testnet.sui.io:443"
-    }
-  },
   "policies": [
-    {
-      "type": "require",
-      "name": "known-user",
-      "check": {
-        "kind": "dynamic-authorization",
-        "url": "https://api.example.com/v1/onara/authorize",
-        "audience": "example-onara-authorization",
-        "timeoutMs": 1500,
-        "cacheTtlSeconds": 0
-      }
-    },
     {
       "type": "deny",
       "name": "blocked-call",
@@ -110,7 +87,6 @@ An Onara deployment has one authoritative `config.json`:
     {
       "type": "allow",
       "name": "create-example",
-      "requires": ["known-user"],
       "gasBudgetMax": "1000000000",
       "commands": { "allowed": ["MoveCall"], "max": 1 },
       "calls": {
@@ -131,15 +107,12 @@ An Onara deployment has one authoritative `config.json`:
 The policy algebra is:
 
 ```text
-deny override; OR(allows); AND(requirements)
+deny override; OR(allows)
 ```
 
-- `require` defines a reusable external authorization check. Schema v1 supports
-  `dynamic-authorization`.
 - `deny` rejects an absolute or structurally matched transaction before allows
   are considered.
-- `allow` defines one complete transaction-shape branch. Its `requires` field is
-  mandatory; an empty array is an intentionally public branch.
+- `allow` defines one complete transaction-shape branch.
 
 Policies can constrain command kinds and counts, Move call targets, type
 arguments, ordering, and the exact flow of command results into later call
@@ -164,18 +137,13 @@ requires that:
 Simulation is mandatory before co-signing, so a caller cannot make the sponsor
 pay for a transaction that already fails in pre-flight checks.
 
-Dynamic authorization requests are signed by the sponsor key configured in
-`SUI_PRIVATE_KEY`. Onara derives its public address for `X-Onara-Identity`, so
-policies contain neither private key material nor a redundant signer address.
-Receivers must independently trust the sponsor address.
-
 See [`api/README.md`](./api/README.md) for the complete schema, request signing
-format, endpoint contract, rate limits, bindings, and operational details.
+format, endpoint contract, and operational details.
 
 ## Run locally
 
-Requirements: [Bun](https://bun.sh), a Sui RPC endpoint, and Wrangler for local
-Worker development.
+Requirements: [Bun](https://bun.sh) and a Sui RPC endpoint. Wrangler is also
+required when using the Cloudflare adapter.
 
 ```bash
 bun install --frozen-lockfile
@@ -187,26 +155,30 @@ bun run --cwd sdk build
 bun run --cwd sdk test
 ```
 
-Start the Worker locally:
+Start either adapter locally:
 
 ```bash
-bun run --cwd api dev
+bun run --cwd api dev:cloudflare
+# or
+bun run --cwd api start:bun
 ```
 
 ## Deploy
 
-Keep environment-specific configuration outside the engine repository, then
-pass its directory to the deployment script:
+Keep host-neutral policy configuration outside the engine repository. For
+Cloudflare, place `config.json` (policies) and `wrangler.jsonc` (deployment
+settings) together, then deploy with the Cloudflare adapter:
 
 ```bash
 cd api
 wrangler secret put SUI_PRIVATE_KEY
-bun run deploy --config /path/to/environment
+bun run deploy:cloudflare --config /path/to/environment
 ```
 
-The deploy command validates the unified configuration and complete policy set
-before generating temporary Wrangler artifacts. The sponsor address and dynamic
-authorization identity are both derived from `SUI_PRIVATE_KEY` at runtime.
+The Cloudflare deploy command validates the policy configuration before
+generating a temporary Worker policy registry. The Bun adapter is deployed as
+a standard Bun process and can load the same policy file with
+`ONARA_CONFIG_PATH`.
 
 ## HTTP surface
 

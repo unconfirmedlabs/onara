@@ -9,7 +9,6 @@
       "name": "@unconfirmed/onara-api",
       "dependencies": {
         "@mysten/sui": "^2.27.0",
-        "@protobuf-ts/grpcweb-transport": "^2.11.1",
         "envalid": "^8.1.1",
         "hono": "^4.12.3",
         "p-retry": "^7.1.1",
