@@ -29,9 +29,10 @@ bun run deploy
 | `SUI_NETWORK` | Network identifier (e.g. `testnet`, `mainnet`) |
 | `SUI_GRPC_URL` | Sui gRPC endpoint URL |
 | `SUI_PRIVATE_KEY` | Bech32 `suiprivkey...` for the sponsor keypair. The same key signs sponsored transactions and dynamic authorization requests. |
-| `DRY_RUN_ONLY` | When set, `/sponsor` always returns dry-run results |
-| `EXECUTION_TIMEOUT_MS` | Max execution time in ms (default: `30000`) |
-| `GAS_BUDGET_MAX` | Optional. Hard server-side cap on gas budget, as a decimal string in MIST (e.g. `"50000000000"`). Enforced before policy matching on both `/sponsor` and `/sponsor/ws` — independent of any per-policy `gasBudgetMax`, which only soft-skips a policy. |
+| `DRY_RUN_ONLY` | Set to `true` or `1` to force `/sponsor` into validate-only mode |
+| `EXECUTION_TIMEOUT_MS` | Overall preflight-through-submission deadline in ms (default: `45000`) |
+| `CONFIRMATION_TIMEOUT_MS` | Max confirmation wait in ms after submission (default: `30000`) |
+| `GAS_BUDGET_MAX` | Hard server-side cap on gas budget, as a decimal string in MIST (e.g. `"50000000"`). It may be omitted only when every enabled allow policy sets `gasBudgetMax`. Enforced before policy matching on `/sponsor`. |
 
 ### Cloudflare bindings
 
@@ -72,11 +73,11 @@ To enable rate limiting, add the bindings under `unsafe.bindings` in `wrangler.j
 }
 ```
 
-Both bindings are checked, in order (sender then IP), before policy matching,
-simulation, and signing. Either binding may be omitted independently — an
-unbound limiter simply isn't enforced. A request that exceeds either limit is
-rejected with `429` over HTTP, or a WebSocket close code `1008` with a
-rate-limit error message.
+The IP limit is checked before cryptographic or RPC work. The sender limit is
+checked only after the submitted transaction signature has been verified, so an
+attacker cannot consume another address's quota. Both still run before policy
+matching, simulation, and sponsor signing. Either binding may be omitted
+independently. A request that exceeds either limit is rejected with HTTP `429`.
 
 ## Deployment
 
@@ -205,10 +206,6 @@ sui client ptb \
   --move-call 0x2::coin::send_funds "<0x2::sui::SUI>" coin sponsor
 ```
 
-### `GET /policies`
-
-Returns the array of configured policy JSON configs.
-
 ### `POST /sponsor`
 
 Validates, simulates, co-signs, and executes a sponsored transaction.
@@ -218,8 +215,9 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 | Param | Type | Default | Description |
 |---|---|---|---|
 | `waitForExecution` | `boolean` | `true` | Wait for transaction finality before responding |
-| `dryRun` | `boolean` | `false` | Validate against policies only — do not sign or submit |
-| `executionTimeoutMs` | `number` | `30000` | Execution timeout in milliseconds (capped at server max) |
+| `dryRun` | `boolean` | `false` | Validate against policies only—do not simulate, sponsor-sign, or submit |
+| `executionTimeoutMs` | `number` | `45000` | Preflight, simulation, sponsor-signing, and submission deadline (capped at server max) |
+| `confirmationTimeoutMs` | `number` | `30000` | Confirmation wait after submission (capped at server max) |
 
 **Request body:**
 
@@ -246,13 +244,16 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 }
 ```
 
-**Error response (400):**
+**Policy rejection (403):**
 
 ```json
 {
-  "error": "Transaction did not match any allow policy. ..."
+  "error": "Transaction is not eligible for sponsorship."
 }
 ```
+
+Detailed policy mismatch diagnostics are written to server logs and are not
+included in the HTTP response.
 
 **Error response (429, rate limited):**
 
@@ -266,20 +267,25 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 
 Policies are JSON files in the `policies/` directory, registered in `policies/index.ts`. The server loads and compiles them at startup.
 
-When a transaction arrives at `/sponsor` (or `/sponsor/ws`), the engine:
+When a transaction arrives at `/sponsor`, the engine:
 
-1. Rejects requests over the `GAS_BUDGET_MAX` server cap (if configured) and requests that exceed the `SENDER_RATE_LIMIT` / `IP_RATE_LIMIT` bindings (if bound) — before any policy matching, simulation, or signing
-2. Verifies the embedded sender and gas owner match the request
-3. Rejects sponsor-scoped balance withdrawals and any command that references `GasCoin`
-4. Evaluates every enabled **deny** policy first; any match rejects immediately.
-5. Collects every structurally complete **allow** branch. Allow branches are
+1. Rejects requests over the global/per-policy gas ceiling and the per-IP rate limit (when configured)
+2. Verifies the sender's signature over the exact transaction bytes, then applies the sender rate limit
+3. Verifies the embedded sender and gas owner match the request and requires an
+   empty gas payment (`[]`) so gas comes only from the sponsor address balance
+4. Requires an expiration no later than the next epoch
+5. Rejects sponsor-scoped balance withdrawals and any command that references `GasCoin`
+6. Evaluates every enabled **deny** policy first; any match rejects immediately.
+7. Collects every structurally complete **allow** branch. Allow branches are
    ORed; configuration order does not lock evaluation to the first candidate.
-6. Resolves every owned-object input over RPC and requires it to be sender-owned
+8. Resolves every owned-object input over RPC and requires it to be sender-owned
    or immutable.
-7. Evaluates each branch's named requirements with AND semantics. A passing
+9. Evaluates each branch's named requirements with AND semantics. A passing
    branch authorizes the transaction. If none passes, an unavailable branch
    produces `503`; otherwise all branches are denied and produce `403`.
-8. Returns the winning concrete allow-policy name and called targets.
+10. For executable requests, simulates the exact sender-signed bytes, sponsor-signs
+    once, and submits those same bytes. Validate-only requests stop before all
+    three operations.
 
 The algebra is `deny override; OR(allows); AND(requirements)`. An allow with
 `"requires": []` is an explicit public branch. No structural match means deny
@@ -292,7 +298,10 @@ these invariants for every policy, independent of what a matched policy
 allows:
 
 - the transaction sender is present and matches the request sender;
+- the sender is not the sponsor and supplied a valid signature for the exact bytes;
 - the gas owner is present and matches the configured sponsor;
+- the gas payment is exactly `[]`, so explicit gas coin objects are never used;
+- expiration is bounded to the current or next epoch;
 - `FundsWithdrawal` inputs may withdraw from the sender only;
 - commands may not reference `GasCoin`; and
 - every `ImmOrOwnedObject` command input must be sender-owned or immutable.
@@ -304,8 +313,8 @@ gas owner, so a sponsor signature alone does not authorize spending someone
 else's owned objects. Onara re-verifies this ownership itself and fails
 closed — a missing object, RPC error, sponsor-owned object, parent-owned
 object, shared owner in an owned-input slot, or unknown owner is rejected
-before simulation and signing. Explicit gas-payment references remain
-separate from command inputs and may be sponsor-owned.
+before simulation and signing. Explicit gas-payment references are rejected;
+the sponsor pays exclusively from its address balance.
 
 ### Policy types
 
@@ -626,7 +635,11 @@ requirements run only for complete branches.
 
 ### SuiNS name matching
 
-Allow policies can gate sponsorship by the sender's SuiNS name using `suinsNames`. When any loaded policy uses this field, the server resolves the sender's default SuiNS name via RPC before policy evaluation. When no policy uses `suinsNames`, no RPC call is made.
+Allow policies can gate sponsorship by the sender's SuiNS name using
+`suinsNames`. Resolution is lazy and request-cached: the server calls SuiNS
+only when evaluation reaches a structurally complete name-gated branch. An
+outage makes that branch unavailable but cannot block an independent public
+or otherwise passing branch.
 
 Name patterns follow DNS wildcard conventions (RFC 4592):
 
@@ -649,10 +662,14 @@ Matching is case-insensitive (`Alice.Onara.SUI` and `alice.onara.sui` are equiva
 The server retries transient failures on key RPC operations (1 retry, 2 attempts total):
 
 - **SuiNS name resolution** — only when a policy uses `suinsNames`
+- **Current system state** — used to enforce bounded transaction expiration
 - **Transaction simulation** — read-only, safe to retry
-- **Transaction execution** — Sui deduplicates by tx digest, safe to retry
+- **Transaction execution** — Sui deduplicates by tx digest, safe to retry; the
+  sponsor signature is created once and reused across attempts
 
-Each operation is still governed by the overall execution timeout (`EXECUTION_TIMEOUT_MS`).
+Preflight RPCs, requirement checks, simulation, sponsor signing, and submission
+share the overall execution deadline (`EXECUTION_TIMEOUT_MS`). Confirmation is
+cancellation-safe and has its own `CONFIRMATION_TIMEOUT_MS` deadline.
 
 ## Pre-v1 migration examples
 
@@ -937,8 +954,8 @@ bun test
 All tests run offline using the Sui SDK's `Transaction.build()` with manually set gas data — no network calls, no gas costs. The test suite covers:
 
 - Strict flat schema-v1 validation and duplicate/reference rejection
-- Security checks (sender/sponsor mismatch detection)
-- Sponsor-only-gas checks (`GasCoin`, sender-scoped withdrawals, owned-input authorization)
+- Security checks (sender signature, sender/sponsor mismatch, bounded expiration)
+- Sponsor-only-gas checks (empty gas payment, `GasCoin`, sender-scoped withdrawals, owned-input authorization)
 - Server-level gas budget cap and per-sender/per-IP rate limit helpers (`src/request-guards.test.ts`)
 - Set mode (target ownership, ranges, `sameAs`, ordering)
 - Wildcards (universal, module, and package level)
@@ -959,12 +976,20 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 
 ```
 src/
-  app.ts          Hono HTTP server — /status, /policies, /sponsor, /sponsor/ws
+  app.ts          Hono HTTP server — /status, /sponsor
   policy.ts       Policy engine — schema, compiler, validator
   policy.test.ts  Offline test suite (bun:test)
   input-authorization.ts       Sender-owned input authorization
   input-authorization.test.ts  Owned-input authorization tests
-  request-guards.ts            Gas budget cap + rate limit helpers (HTTP + WS)
+  sender-signature.ts          Exact-byte sender signature verification
+  sender-signature.test.ts     Sender signature tests
+  execution.ts                 Sign-once submission and confirmation flow
+  execution.test.ts            Sponsor signing/submission tests
+  sponsorship-analysis.ts      Immutable request facts and deduplicated RPC reads
+  sponsorship-analysis.test.ts Request-scoped fact caching tests
+  sponsorship-service.ts       Sponsorship pipeline shared by execution modes
+  sponsorship-service.test.ts  Pipeline ordering and transport mapping tests
+  request-guards.ts            Gas budget cap + rate limit helpers
   request-guards.test.ts       Request guard tests
   dynamic-authorization.ts       Dynamic authorization HTTP check, request signing, verification, and caching
   dynamic-authorization.test.ts  Dynamic authorization protocol and behavior tests

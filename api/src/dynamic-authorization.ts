@@ -274,6 +274,7 @@ export async function checkDynamicAuthorization({
   fetchImpl = fetch,
   now = () => Date.now(),
   requestId = () => crypto.randomUUID(),
+  signal,
 }: {
   check: DynamicAuthorizationCheck
   requirementName: string
@@ -285,6 +286,7 @@ export async function checkDynamicAuthorization({
   fetchImpl?: typeof fetch
   now?: () => number
   requestId?: () => string
+  signal?: AbortSignal
 }): Promise<void> {
   let identity: string
   try {
@@ -396,7 +398,9 @@ export async function checkDynamicAuthorization({
       method: DYNAMIC_AUTHORIZATION_REQUEST_METHOD,
       headers,
       redirect: 'manual',
-      signal: AbortSignal.timeout(check.timeoutMs),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(check.timeoutMs)])
+        : AbortSignal.timeout(check.timeoutMs),
     })
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : 'unknown error'

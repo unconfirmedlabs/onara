@@ -122,9 +122,8 @@ export type SponsorOptions = {
   dryRun?: boolean
   waitForExecution?: boolean
   /**
-   * Run pre-flight simulation before execution. Defaults to `true`; pass `false`
-   * to skip (e.g. for fire-and-forget paths where the caller has already
-   * validated the transaction client-side).
+   * @deprecated Onara always runs pre-flight simulation before sponsoring.
+   * This option remains for source compatibility and is ignored.
    */
   simulate?: boolean
 }

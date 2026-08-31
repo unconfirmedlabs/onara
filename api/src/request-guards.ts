@@ -1,6 +1,6 @@
-// Server-level request guards shared by the HTTP and WebSocket sponsor
-// transports: a hard cap on gas budget and optional Workers Rate Limiting
-// bindings, both enforced before policy matching / simulation / signing.
+// Server-level request guards for sponsorship: a hard cap on gas budget and
+// optional Workers Rate Limiting bindings, both enforced before policy
+// matching / simulation / signing.
 
 export class GasBudgetExceededError extends Error {}
 export class RateLimitedError extends Error {

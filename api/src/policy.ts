@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { Transaction } from '@mysten/sui/transactions'
+import { Transaction, type TransactionData } from '@mysten/sui/transactions'
 import {
   isValidSuiAddress,
   normalizeStructTag,
@@ -411,7 +411,7 @@ export type CompiledPolicies = {
   needsSuinsResolution: boolean
 }
 
-type SuinsNamePattern =
+export type SuinsNamePattern =
   | { kind: 'exact'; name: string }
   | { kind: 'wildcard'; suffix: string }
 
@@ -425,7 +425,7 @@ function parseSuinsNamePattern(raw: string): SuinsNamePattern {
 
 function matchSuinsName(
   name: string | null,
-  patterns: SuinsNamePattern[],
+  patterns: readonly SuinsNamePattern[],
 ): boolean {
   if (name === null) return false
   const normalized = name.toLowerCase()
@@ -1034,6 +1034,8 @@ function validateAllowPolicy(
 export type PolicyAllowBranch = {
   policyName: string
   requirements: CompiledRequirement[]
+  /** Present only when SuiNS matching was deliberately deferred to evaluation. */
+  suinsNamePatterns?: readonly SuinsNamePattern[]
 }
 
 export type PolicyEvaluationPlan = {
@@ -1042,22 +1044,23 @@ export type PolicyEvaluationPlan = {
   allowBranches: PolicyAllowBranch[]
 }
 
-export function validateSponsoredTxPayload({
-  txBytesBase64,
+export function validateSponsoredTransactionData({
+  txData,
   expectedSender,
   expectedSponsor,
+  currentEpoch,
   policies,
   senderName,
+  deferSuinsNameResolution = false,
 }: {
-  txBytesBase64: string
+  txData: TransactionData
   expectedSender: string
   expectedSponsor: string
+  currentEpoch: bigint
   policies: CompiledPolicies
   senderName?: string | null
+  deferSuinsNameResolution?: boolean
 }): PolicyEvaluationPlan {
-  const tx = Transaction.from(txBytesBase64)
-  const txData = tx.getData()
-
   if (!txData.sender) {
     throw new Error('Sponsored transaction is missing its sender.')
   }
@@ -1075,6 +1078,40 @@ export function validateSponsoredTxPayload({
   ) {
     throw new Error(
       'Transaction gas owner does not match configured sponsor.',
+    )
+  }
+  if (
+    normalizeSuiAddress(txData.sender) ===
+    normalizeSuiAddress(expectedSponsor)
+  ) {
+    throw new Error('Transaction sender cannot be the sponsor.')
+  }
+  if (txData.gasData.payment === null || txData.gasData.payment.length !== 0) {
+    throw new Error(
+      'Sponsored transactions must use the sponsor address balance (gas payment must be empty).',
+    )
+  }
+
+  const expiration = txData.expiration
+  const expirationMaxEpoch =
+    !expiration || expiration.$kind === 'None'
+      ? null
+      : expiration.$kind === 'Epoch'
+        ? BigInt(expiration.Epoch)
+        : expiration.ValidDuring.maxEpoch === null
+          ? null
+          : BigInt(expiration.ValidDuring.maxEpoch)
+  if (expirationMaxEpoch === null) {
+    throw new Error(
+      'Sponsored transactions must set a bounded epoch expiration.',
+    )
+  }
+  if (expirationMaxEpoch < currentEpoch) {
+    throw new Error('Sponsored transaction expiration has already elapsed.')
+  }
+  if (expirationMaxEpoch > currentEpoch + 1n) {
+    throw new Error(
+      `Sponsored transaction expiration exceeds the next epoch (${currentEpoch + 1n}).`,
     )
   }
 
@@ -1142,6 +1179,7 @@ export function validateSponsoredTxPayload({
     if (policy.senders && !policy.senders.has(normalizedSender)) continue
     if (
       policy.suinsNamePatterns &&
+      !deferSuinsNameResolution &&
       !matchSuinsName(senderName ?? null, policy.suinsNamePatterns)
     ) {
       continue
@@ -1160,6 +1198,9 @@ export function validateSponsoredTxPayload({
       allowBranches.push({
         policyName: policy.name,
         requirements: policy.requirements,
+        ...(deferSuinsNameResolution && policy.suinsNamePatterns
+          ? { suinsNamePatterns: policy.suinsNamePatterns }
+          : {}),
       })
     } catch (error) {
       errors.push(
@@ -1181,6 +1222,28 @@ export function validateSponsoredTxPayload({
   }
 }
 
+/**
+ * Convenience wrapper for callers that do not already own a parsed transaction
+ * snapshot. Request pipelines should parse once and call
+ * {@link validateSponsoredTransactionData} directly.
+ */
+export function validateSponsoredTxPayload({
+  txBytesBase64,
+  ...options
+}: {
+  txBytesBase64: string
+  expectedSender: string
+  expectedSponsor: string
+  currentEpoch: bigint
+  policies: CompiledPolicies
+  senderName?: string | null
+}): PolicyEvaluationPlan {
+  return validateSponsoredTransactionData({
+    ...options,
+    txData: Transaction.from(txBytesBase64).getData(),
+  })
+}
+
 // ─── Requirement algebra ────────────────────────────────────────────────────
 
 export type RequirementDecision = 'allow' | 'deny' | 'unavailable'
@@ -1193,20 +1256,48 @@ export type AuthorizationDecision =
 export async function evaluatePolicyRequirements({
   allowBranches,
   evaluate,
+  resolveSenderName,
 }: {
   allowBranches: readonly PolicyAllowBranch[]
   evaluate: (input: {
     requirement: CompiledRequirement
     policyName: string
   }) => Promise<RequirementDecision>
+  resolveSenderName?: () => Promise<string | null>
 }): Promise<AuthorizationDecision> {
+  // A complete public branch is already a proof of this OR expression. Resolve
+  // it before any branch-local RPC or external authorization side effect.
+  const publicBranch = allowBranches.find(
+    (branch) =>
+      !branch.suinsNamePatterns && branch.requirements.length === 0,
+  )
+  if (publicBranch) {
+    return { status: 'allowed', policyName: publicBranch.policyName }
+  }
+
   let sawUnavailable = false
 
   for (const branch of allowBranches) {
     let branchUnavailable = false
     let branchDenied = false
 
-    for (const requirement of branch.requirements) {
+    if (branch.suinsNamePatterns) {
+      try {
+        if (!resolveSenderName) {
+          throw new Error('SuiNS name resolver is unavailable.')
+        }
+        const senderName = await resolveSenderName()
+        if (!matchSuinsName(senderName, branch.suinsNamePatterns)) {
+          branchDenied = true
+        }
+      } catch {
+        // SuiNS lookup is one conjunct in this branch. Keep evaluating other
+        // requirements because an explicit deny must dominate unavailable.
+        branchUnavailable = true
+      }
+    }
+
+    for (const requirement of branchDenied ? [] : branch.requirements) {
       const decision = await evaluate({
         requirement,
         policyName: branch.policyName,

@@ -9,8 +9,8 @@
       "custom_domain": true
     }
   ],
-  // Optional: hard server-side cap on gas budget, in MIST (decimal string).
-  // Enforced before policy matching on both /sponsor and /sponsor/ws.
+  // Hard server-side cap on gas budget, in MIST (decimal string). This may be
+  // omitted only when every enabled allow policy defines gasBudgetMax.
   // "vars": {
   //   "GAS_BUDGET_MAX": "50000000000"
   // },

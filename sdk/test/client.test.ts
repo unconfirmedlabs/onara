@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test'
+import type { ClientWithCoreApi } from '@mysten/sui/client'
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
+import { Transaction } from '@mysten/sui/transactions'
+import { normalizeSuiAddress } from '@mysten/sui/utils'
 import { OnaraClient } from '../src/client'
 import { OnaraError } from '../src/errors'
-import type { PolicyConfig } from '../src/types'
 
 const BASE_URL = 'https://onara.example.com'
 
@@ -34,75 +37,6 @@ describe('status()', () => {
       chainId: '4c78adac',
       address: '0xabc',
     })
-  })
-})
-
-// ─── policies() ──────────────────────────────────────────────────────────────
-
-describe('policies()', () => {
-  test('returns policy configs array', async () => {
-    const policies: PolicyConfig[] = [
-      {
-        type: 'require',
-        name: 'signed-in-user',
-        check: {
-          kind: 'dynamic-authorization',
-          url: 'https://api.example.com/v1/onara/authorize',
-          audience: 'example-onara-authorization',
-          timeoutMs: 1_500,
-          cacheTtlSeconds: 0,
-        },
-      },
-      {
-        type: 'deny',
-        name: 'emergency-stop',
-        enabled: false,
-        when: { kind: 'always' },
-      },
-      {
-        type: 'allow',
-        name: 'test-policy',
-        requires: ['signed-in-user'],
-        gasBudgetMax: '1000000000',
-        commands: { allowed: ['MoveCall'], max: 2 },
-        calls: {
-          mode: 'sequence',
-          rules: [
-            {
-              id: 'zero',
-              targets: ['0x2::balance::zero'],
-              count: { min: 1, max: 1 },
-            },
-            {
-              id: 'send',
-              targets: ['0x2::balance::send_funds'],
-            },
-          ],
-          resultFlow: [
-            {
-              from: { rule: 'zero', result: 0 },
-              to: [{ rule: 'send', argument: 0 }],
-            },
-          ],
-        },
-      },
-    ]
-
-    const client = new OnaraClient({
-      url: BASE_URL,
-      fetch: mockFetch((url) => {
-        expect(url).toBe(`${BASE_URL}/policies`)
-        return Response.json(policies)
-      }),
-    })
-
-    const result = await client.policies()
-    expect(result).toEqual(policies)
-    expect(result.map((policy) => policy.type)).toEqual([
-      'require',
-      'deny',
-      'allow',
-    ])
   })
 })
 
@@ -170,6 +104,23 @@ describe('sponsor()', () => {
     })
   })
 
+  test('does not let callers disable server-side simulation', async () => {
+    const client = new OnaraClient({
+      url: BASE_URL,
+      fetch: mockFetch((url) => {
+        expect(new URL(url).searchParams.has('simulate')).toBe(false)
+        return Response.json({ digest: '0xresult' })
+      }),
+    })
+
+    await client.sponsor({
+      sender: '0x1',
+      txBytes: 'AQID',
+      txSignature: 'BAUG',
+      simulate: false,
+    })
+  })
+
   test('throws OnaraError on 400 response', async () => {
     const client = new OnaraClient({
       url: BASE_URL,
@@ -193,6 +144,65 @@ describe('sponsor()', () => {
       expect((err as OnaraError).message).toBe('Invalid request')
       expect((err as OnaraError).status).toBe(400)
     }
+  })
+})
+
+// ─── sponsorTransaction() ────────────────────────────────────────────────────
+
+describe('sponsorTransaction()', () => {
+  test('forces address-balance gas instead of falling back to gas coin objects', async () => {
+    const signer = new Ed25519Keypair()
+    const sponsor = normalizeSuiAddress('0x2')
+    const transaction = new Transaction()
+    transaction.setGasBudget(10_000_000)
+    transaction.setGasPrice(1_000)
+    transaction.setExpiration({
+      ValidDuring: {
+        minEpoch: '1',
+        maxEpoch: '2',
+        minTimestamp: null,
+        maxTimestamp: null,
+        chain: '69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD',
+        nonce: 1,
+      },
+    })
+    // A caller-supplied payment must be overwritten, not retained as a fallback.
+    transaction.setGasPayment([
+      {
+        objectId: normalizeSuiAddress('0x99'),
+        version: '1',
+        digest: '11111111111111111111111111111111',
+      },
+    ])
+    transaction.moveCall({ target: '0x2::coin::zero', typeArguments: ['0x2::sui::SUI'] })
+
+    const client = new OnaraClient({
+      url: BASE_URL,
+      client: { core: {} } as ClientWithCoreApi,
+      fetch: mockFetch((url, init) => {
+        if (url === `${BASE_URL}/status`) {
+          return Response.json({
+            network: 'testnet',
+            chainId: '69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD',
+            address: sponsor,
+          })
+        }
+
+        const body = JSON.parse(init?.body as string) as {
+          sender: string
+          txBytes: string
+          txSignature: string
+        }
+        const data = Transaction.from(body.txBytes).getData()
+        expect(data.sender).toBe(normalizeSuiAddress(signer.toSuiAddress()))
+        expect(data.gasData.owner).toBe(sponsor)
+        expect(data.gasData.payment).toEqual([])
+        expect(body.txSignature.length).toBeGreaterThan(0)
+        return Response.json({ digest: 'result' })
+      }),
+    })
+
+    await client.sponsorTransaction({ transaction, signer })
   })
 })
 

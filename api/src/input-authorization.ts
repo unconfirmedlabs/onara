@@ -37,10 +37,12 @@ export async function assertSenderControlsOwnedInputs({
   client,
   sender,
   objectIds,
+  signal,
 }: {
   client: ClientWithCoreApi
   sender: string
   objectIds: readonly string[]
+  signal?: AbortSignal
 }): Promise<void> {
   if (objectIds.length === 0) return
 
@@ -52,7 +54,7 @@ export async function assertSenderControlsOwnedInputs({
   try {
     const responses = await Promise.all(
       chunks(normalizedIds, OBJECTS_PER_REQUEST).map((objectIds) =>
-        client.core.getObjects({ objectIds }),
+        client.core.getObjects({ objectIds, signal }),
       ),
     )
     objects = responses.flatMap((response) => response.objects)

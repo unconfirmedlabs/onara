@@ -5,7 +5,6 @@ import { toBase64 } from '@mysten/sui/utils'
 import { OnaraError } from './errors'
 import type {
   StatusResponse,
-  PolicyConfig,
   SponsorOptions,
   SponsorResponse,
   TransactionStatusResponse,
@@ -59,20 +58,10 @@ export class OnaraClient {
     return res.json() as Promise<StatusResponse>
   }
 
-  async policies(): Promise<PolicyConfig[]> {
-    const res = await this.fetch(`${this.baseUrl}/policies`)
-    if (!res.ok) {
-      const body = (await res.json()) as OnaraErrorResponse
-      throw new OnaraError(body.error, res.status)
-    }
-    return res.json() as Promise<PolicyConfig[]>
-  }
-
   async sponsor(options: SponsorOptions): Promise<SponsorResponse> {
     const params = new URLSearchParams()
     if (options.dryRun) params.set('dryRun', 'true')
     if (options.waitForExecution === false) params.set('waitForExecution', 'false')
-    if (options.simulate === false) params.set('simulate', 'false')
 
     const query = params.toString()
     const url = `${this.baseUrl}/sponsor${query ? `?${query}` : ''}`
@@ -105,26 +94,31 @@ export class OnaraClient {
     client?: ClientWithCoreApi
     dryRun?: boolean
     waitForExecution?: boolean
+    /** @deprecated Onara always simulates before sponsoring. This option is ignored. */
     simulate?: boolean
   }): Promise<SponsorResponse> {
-    const { transaction, signer, dryRun, waitForExecution, simulate } = options
+    const { transaction, signer, dryRun, waitForExecution } = options
     const client = this.resolveClient(options.client)
+    const sender = signer.toSuiAddress()
 
     const { address } = await this.status()
 
-    transaction.setSender(signer.toSuiAddress())
+    transaction.setSender(sender)
     transaction.setGasOwner(address)
+    // Onara sponsors exclusively from the sponsor's address balance. Setting an
+    // explicit empty payment prevents the Sui resolver from falling back to
+    // sponsor-owned coin objects when that balance is insufficient.
+    transaction.setGasPayment([])
 
     const bytes = await transaction.build({ client })
     const { signature } = await signer.signTransaction(bytes)
 
     return this.sponsor({
-      sender: signer.toSuiAddress(),
+      sender,
       txBytes: toBase64(bytes),
       txSignature: signature,
       dryRun,
       waitForExecution,
-      simulate,
     })
   }
 

@@ -64,11 +64,12 @@ const result = await client.onara.sponsorTransaction({
 ```
 
 The extension fetches the sponsor address, sets the transaction sender and gas
-owner, builds with the registered Sui client, collects the sender signature, and
+owner, forces an empty gas payment so only the sponsor's address balance can be
+used, builds with the registered Sui client, collects the sender signature, and
 submits the sponsorship request. The sender's key never leaves the client.
 
 See [`sdk/README.md`](./sdk/README.md) for the standalone client, dry runs,
-policy inspection, transaction status recovery, and the full typed API.
+transaction status recovery, and the full typed API.
 
 ## Policy model
 
@@ -150,11 +151,18 @@ branches are rejected when configuration loads.
 Policy matching is only one layer. Before Onara simulates or signs, it also
 requires that:
 
-1. the embedded transaction sender equals the requesting sender;
-2. the gas owner equals the configured sponsor;
-3. balance withdrawals belong to the sender, never the sponsor;
-4. commands do not reference `GasCoin`; and
-5. every owned object input is sender-owned or immutable.
+1. the sender's signature is valid for the exact transaction bytes;
+2. the embedded transaction sender equals the requesting sender and is not the sponsor;
+3. the gas owner equals the configured sponsor;
+4. the gas payment is empty, so gas comes only from the sponsor's address balance;
+5. the transaction expires no later than the next epoch;
+6. balance withdrawals belong to the sender, never the sponsor;
+7. commands do not reference `GasCoin`; and
+8. every owned object input is sender-owned or immutable; and
+9. every enabled allow path has a configured global or per-policy gas ceiling.
+
+Simulation is mandatory before co-signing, so a caller cannot make the sponsor
+pay for a transaction that already fails in pre-flight checks.
 
 Dynamic authorization requests are signed by the sponsor key configured in
 `SUI_PRIVATE_KEY`. Onara derives its public address for `X-Onara-Identity`, so
@@ -205,8 +213,7 @@ authorization identity are both derived from `SUI_PRIVATE_KEY` at runtime.
 | Endpoint | Purpose |
 |---|---|
 | `GET /status` | Network, chain ID, sponsor address, and sponsor balances |
-| `GET /policies` | Active schema-v1 policy configuration |
-| `POST /sponsor` | Validate, optionally simulate, sponsor, and execute a signed transaction |
+| `POST /sponsor` | Validate, simulate, sponsor, and execute a signed transaction |
 | `GET /sponsor/:digest/status` | Recover transaction status after an uncertain confirmation |
 
 ## License

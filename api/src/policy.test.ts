@@ -19,6 +19,7 @@ const PKG =
 const OTHER_PKG =
   '0x0000000000000000000000000000000000000000000000000000000000000def'
 const ZERO_DIGEST = '11111111111111111111111111111111'
+const CHAIN_ID = '69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD'
 const IDENTITY =
   '0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f'
 
@@ -54,6 +55,7 @@ async function buildTxBytes(
     sender?: string
     sponsor?: string
     gasBudget?: number | bigint
+    gasPayment?: 'addressBalance' | 'coin'
   } = {},
 ): Promise<string> {
   const tx = new Transaction()
@@ -61,14 +63,28 @@ async function buildTxBytes(
   tx.setGasOwner(opts.sponsor ?? SPONSOR)
   tx.setGasBudget(opts.gasBudget ?? 10_000_000)
   tx.setGasPrice(1_000)
-  tx.setGasPayment([
-    {
-      objectId:
-        '0x0000000000000000000000000000000000000000000000000000000000000000',
-      version: '0',
-      digest: ZERO_DIGEST,
+  tx.setGasPayment(
+    opts.gasPayment === 'coin'
+      ? [
+          {
+            objectId:
+              '0x0000000000000000000000000000000000000000000000000000000000000000',
+            version: '0',
+            digest: ZERO_DIGEST,
+          },
+        ]
+      : [],
+  )
+  tx.setExpiration({
+    ValidDuring: {
+      minEpoch: '1',
+      maxEpoch: '2',
+      minTimestamp: null,
+      maxTimestamp: null,
+      chain: CHAIN_ID,
+      nonce: 1,
     },
-  ])
+  })
   setup(tx)
   return toBase64(await tx.build())
 }
@@ -82,6 +98,7 @@ function validate(
     txBytesBase64,
     expectedSender: SENDER,
     expectedSponsor: SPONSOR,
+    currentEpoch: 1n,
     policies,
     senderName,
   })
@@ -350,6 +367,50 @@ describe('global transaction invariants and deny override', () => {
       { sponsor: '0x3' },
     )
     expect(() => validate(wrongSponsor, policies)).toThrow(/gas owner/)
+  })
+
+  test('rejects the sponsor as transaction sender', async () => {
+    const policies = loadPolicies([allow()])
+    const txBytes = await buildTxBytes(
+      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
+      { sender: SPONSOR },
+    )
+    expect(() =>
+      validateSponsoredTxPayload({
+        txBytesBase64: txBytes,
+        expectedSender: SPONSOR,
+        expectedSponsor: SPONSOR,
+        currentEpoch: 1n,
+        policies,
+      }),
+    ).toThrow(/cannot be the sponsor/)
+  })
+
+  test('requires address-balance gas and rejects explicit gas coin payments', async () => {
+    const policies = loadPolicies([allow()])
+    const txBytes = await buildTxBytes(
+      (tx) => tx.moveCall({ target: `${PKG}::mod::fn` }),
+      { gasPayment: 'coin' },
+    )
+    expect(() => validate(txBytes, policies)).toThrow(/address balance/)
+  })
+
+  test('requires expiration no later than the next epoch', async () => {
+    const policies = loadPolicies([allow()])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.setExpiration({ Epoch: 3 })
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/expiration exceeds/)
+  })
+
+  test('rejects an expiration that has already elapsed', async () => {
+    const policies = loadPolicies([allow()])
+    const txBytes = await buildTxBytes((tx) => {
+      tx.setExpiration({ Epoch: 0 })
+      tx.moveCall({ target: `${PKG}::mod::fn` })
+    })
+    expect(() => validate(txBytes, policies)).toThrow(/already elapsed/)
   })
 
   test('returns de-duplicated owned inputs for RPC ownership authorization', async () => {
@@ -891,6 +952,68 @@ describe('allow-branch and requirement truth algebra', () => {
     })
     expect(result).toEqual({ status: 'allowed', policyName: 'public' })
     expect(calls).toBe(0)
+  })
+
+  test('an independent public branch bypasses unnecessary SuiNS work', async () => {
+    let nameCalls = 0
+    const result = await evaluatePolicyRequirements({
+      allowBranches: [
+        {
+          policyName: 'name-gated',
+          requirements: [],
+          suinsNamePatterns: [{ kind: 'wildcard', suffix: '.onara.sui' }],
+        },
+        { policyName: 'public', requirements: [] },
+      ],
+      resolveSenderName: async () => {
+        nameCalls++
+        throw new Error('SuiNS unavailable')
+      },
+      evaluate: async () => 'allow',
+    })
+
+    expect(result).toEqual({ status: 'allowed', policyName: 'public' })
+    expect(nameCalls).toBe(0)
+  })
+
+  test('a SuiNS outage remains unavailable when no branch can pass', async () => {
+    let nameCalls = 0
+    const result = await evaluatePolicyRequirements({
+      allowBranches: [
+        {
+          policyName: 'name-gated',
+          requirements: [],
+          suinsNamePatterns: [{ kind: 'wildcard', suffix: '.onara.sui' }],
+        },
+      ],
+      resolveSenderName: async () => {
+        nameCalls++
+        throw new Error('SuiNS unavailable')
+      },
+      evaluate: async () => 'allow',
+    })
+
+    expect(result).toEqual({ status: 'unavailable' })
+    expect(nameCalls).toBe(1)
+  })
+
+  test('a requirement denial dominates an unavailable SuiNS conjunct', async () => {
+    const requirementItem = requirementPlan().allowBranches[0]!.requirements[0]!
+    const result = await evaluatePolicyRequirements({
+      allowBranches: [
+        {
+          policyName: 'name-gated',
+          requirements: [requirementItem],
+          suinsNamePatterns: [{ kind: 'exact', name: 'alice.onara.sui' }],
+        },
+      ],
+      resolveSenderName: async () => {
+        throw new Error('SuiNS unavailable')
+      },
+      evaluate: async () => 'deny',
+    })
+
+    expect(result).toEqual({ status: 'denied' })
   })
 })
 

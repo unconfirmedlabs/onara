@@ -37,9 +37,8 @@ import { OnaraClient } from '@unconfirmed/onara'
 
 const onara = new OnaraClient('https://my-onara.example.com')
 
-// Check sponsor status & view configured policies
+// Check sponsor status
 const { address, balances } = await onara.status()
-const policies = await onara.policies()
 
 // High-level: build, sign, and sponsor (pass the Sui client used to build)
 const result = await onara.sponsorTransaction({
@@ -75,21 +74,17 @@ Create a client directly. `fetch` injects a custom fetch (useful for testing); `
 
 Returns the server's network, chain identifier, sponsor address, and balances.
 
-### `client.policies()`
+### Policy configuration types
 
-Returns the typed array of configured schema-v1 policies. `PolicyConfig` is a
+For local configuration tooling, the SDK exports `PolicyConfig`, a
 discriminated union of reusable `require` policies, absolute `deny` policies,
-and independent `allow` authorization branches:
+and independent `allow` authorization branches. The server intentionally does
+not expose its active policy configuration over HTTP.
 
 ```typescript
 import type { PolicyConfig } from '@unconfirmed/onara'
 
-const policies: PolicyConfig[] = await onara.policies()
-for (const policy of policies) {
-  if (policy.type === 'allow') {
-    console.log(policy.name, policy.requires)
-  }
-}
+const policies: PolicyConfig[] = [/* local deployment policies */]
 ```
 
 Every allow policy explicitly declares `requires`; `[]` is an intentional
@@ -121,7 +116,14 @@ Submit pre-built transaction bytes for sponsorship.
 - `txSignature` — base64-encoded sender signature
 - `dryRun?` — validate against policies without submitting
 - `waitForExecution?` — wait for transaction finality (default `true`)
-- `simulate?` — run pre-flight simulation before execution (default `true`)
+
+The server always verifies the sender signature and simulates before sponsor
+signing. Simulation cannot be disabled by a caller.
+
+The transaction must set the Onara sponsor as gas owner and use an empty gas
+payment (`transaction.setGasPayment([])`). Explicit gas coin payments are
+rejected; Onara sponsors exclusively from the sponsor's address balance. It
+must also carry an epoch expiration no later than the next epoch.
 
 On a confirmation timeout the thrown `OnaraError` carries `digest` and `txStatus: 'unconfirmed'`; use `getTransactionStatus(digest)` to resolve the final outcome.
 
@@ -129,10 +131,14 @@ On a confirmation timeout the thrown `OnaraError` carries `digest` and `txStatus
 
 High-level convenience that builds, signs, and sponsors a transaction.
 
+This helper sets `gasPayment` to `[]` before building, so the Sui resolver
+cannot fall back to sponsor-owned coin objects. The resolver also supplies the
+bounded `ValidDuring` expiration required for address-balance transactions.
+
 - `transaction` — a Sui `Transaction` instance
 - `signer` — a Sui `Signer` (e.g. `Ed25519Keypair`)
 - `client?` — a Sui client used to build the transaction (defaults to the registered/constructed client)
-- `dryRun?`, `waitForExecution?`, `simulate?` — as in `sponsor`
+- `dryRun?`, `waitForExecution?` — as in `sponsor`
 
 ### `client.getTransactionStatus(digest)`
 

@@ -53,6 +53,7 @@ tx.moveCall({
 
 tx.setSender(sender.toSuiAddress())
 tx.setGasOwner(status.address)
+tx.setGasPayment([])
 
 const bytes = await tx.build({ client: suiClient })
 const { signature } = await sender.signTransaction(bytes)
