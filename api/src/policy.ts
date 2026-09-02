@@ -992,14 +992,20 @@ export function validateSponsoredTransactionData({
   }
 
   const expiration = txData.expiration
-  const expirationMaxEpoch =
-    !expiration || expiration.$kind === 'None'
-      ? null
-      : expiration.$kind === 'Epoch'
-        ? BigInt(expiration.Epoch)
-        : expiration.ValidDuring.maxEpoch === null
-          ? null
-          : BigInt(expiration.ValidDuring.maxEpoch)
+  let expirationMaxEpoch: bigint | null = null
+  if (expiration?.$kind === 'Epoch' && expiration.Epoch !== undefined) {
+    expirationMaxEpoch = BigInt(expiration.Epoch)
+  } else if (
+    expiration?.$kind === 'ValidDuring' &&
+    expiration.ValidDuring?.maxEpoch != null
+  ) {
+    expirationMaxEpoch = BigInt(expiration.ValidDuring.maxEpoch)
+  } else if (
+    expiration?.$kind === 'Validity' &&
+    expiration.Validity?.maxEpoch != null
+  ) {
+    expirationMaxEpoch = BigInt(expiration.Validity.maxEpoch)
+  }
   if (expirationMaxEpoch === null) {
     throw new Error(
       'Sponsored transactions must set a bounded epoch expiration.',
