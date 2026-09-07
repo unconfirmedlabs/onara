@@ -5,6 +5,10 @@ export type StatusResponse = {
   chainId: string
   address: string
   balances: { active: string; pending: string }
+  /** SHA-256 of the server's canonical policy configuration. */
+  policyDigest: string
+  policyVersion: number
+  engineVersion: string
 }
 
 // ─── Policy Config Types (schema version 1) ──────────────────────────────────

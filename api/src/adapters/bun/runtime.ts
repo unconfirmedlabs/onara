@@ -15,11 +15,11 @@ export function createBunRuntime(
 ): OnaraRuntime {
   return createOnaraRuntime({
     environment,
-    policies: loadPolicies(environment),
+    config: loadConfig(environment),
   })
 }
 
-function loadPolicies(environment: BunAdapterEnvironment): readonly unknown[] {
+function loadConfig(environment: BunAdapterEnvironment) {
   if (!environment.ONARA_CONFIG_PATH) {
     throw new Error(
       'ONARA_CONFIG_PATH must be configured for the Bun adapter. Refusing to start with an in-tree policy.',
@@ -27,5 +27,5 @@ function loadPolicies(environment: BunAdapterEnvironment): readonly unknown[] {
   }
   return parseOnaraConfigText(
     readFileSync(environment.ONARA_CONFIG_PATH, 'utf8'),
-  ).policies
+  )
 }

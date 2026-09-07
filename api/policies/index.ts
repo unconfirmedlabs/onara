@@ -1,5 +1,5 @@
 import allowAll from './allow-all.json'
 
-const sponsorPolicies = [allowAll]
+const sponsorConfig = { version: 1, policies: [allowAll] }
 
-export default sponsorPolicies
+export default sponsorConfig

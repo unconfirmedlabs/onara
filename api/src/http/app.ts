@@ -59,6 +59,7 @@ export function createOnaraApp(
   app.get('/livez', (c) => c.json({ status: 'live' }))
 
   app.get('/readyz', async (c) => {
+    c.header('Cache-Control', 'no-store')
     try {
       const chainId = await assertOnaraRuntimeReady(runtime, {
         signal: AbortSignal.timeout(readinessTimeoutMs),
@@ -67,6 +68,9 @@ export function createOnaraApp(
         status: 'ready',
         network: runtime.environment.SUI_NETWORK,
         chainId,
+        policyDigest: runtime.policyDigest,
+        policyVersion: runtime.policyVersion,
+        engineVersion: runtime.engineVersion,
       })
     } catch (error) {
       logReadinessFailure(error)
@@ -75,6 +79,7 @@ export function createOnaraApp(
   })
 
   app.get('/status', async (c) => {
+    c.header('Cache-Control', 'no-store')
     startTime(c, 'init', 'Client & keypair init')
     endTime(c, 'init')
 
@@ -90,6 +95,9 @@ export function createOnaraApp(
         network: runtime.environment.SUI_NETWORK,
         chainId,
         address: runtime.sponsorAddress,
+        policyDigest: runtime.policyDigest,
+        policyVersion: runtime.policyVersion,
+        engineVersion: runtime.engineVersion,
         balances: {
           active: balanceResult.balance.addressBalance,
           pending: balanceResult.balance.coinBalance,

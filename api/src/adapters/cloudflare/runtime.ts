@@ -1,4 +1,4 @@
-import sponsorPolicies from '../../../policies'
+import sponsorConfig from '../../../policies'
 import {
   createOnaraRuntime,
   type OnaraEnvironment,
@@ -12,6 +12,6 @@ export function createCloudflareRuntime(
 ): OnaraRuntime {
   return createOnaraRuntime({
     environment: bindings,
-    policies: sponsorPolicies,
+    config: sponsorConfig,
   })
 }

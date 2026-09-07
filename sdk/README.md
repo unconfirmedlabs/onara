@@ -72,7 +72,13 @@ Create a client directly. `fetch` injects a custom fetch (useful for testing); `
 
 ### `client.status()`
 
-Returns the server's network, chain identifier, sponsor address, and balances.
+Returns the server's network, chain identifier, sponsor address, balances,
+`policyDigest` (`sha256:` plus 64 lowercase hex characters), `policyVersion`
+(configuration schema version), and `engineVersion` (API package version).
+The digest fingerprints the complete canonical policy configuration; it
+does not include environment settings or engine code. Compute the expected
+value locally with `onara policy-digest config.json` using the API package's
+Bun CLI. The server does not expose the policies themselves.
 
 ### Policy configuration types
 

@@ -7,8 +7,13 @@
     },
     "api": {
       "name": "@unconfirmed/onara-api",
+      "version": "0.1.0",
+      "bin": {
+        "onara": "src/cli/index.ts",
+      },
       "dependencies": {
         "@mysten/sui": "^2.27.0",
+        "@noble/hashes": "^2.3.0",
         "envalid": "^8.1.1",
         "hono": "^4.12.3",
         "p-retry": "^7.1.1",

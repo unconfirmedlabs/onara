@@ -1,5 +1,8 @@
 {
   "name": "onara",
   "private": true,
+  "scripts": {
+    "onara": "bun api/src/cli/index.ts"
+  },
   "workspaces": ["api", "sdk"]
 }

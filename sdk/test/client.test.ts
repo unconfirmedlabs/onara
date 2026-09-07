@@ -27,6 +27,9 @@ describe('status()', () => {
           network: 'testnet',
           chainId: '4c78adac',
           address: '0xabc',
+          policyDigest: `sha256:${'a'.repeat(64)}`,
+          policyVersion: 1,
+          engineVersion: '0.1.0',
         })
       }),
     })
@@ -36,6 +39,9 @@ describe('status()', () => {
       network: 'testnet',
       chainId: '4c78adac',
       address: '0xabc',
+      policyDigest: `sha256:${'a'.repeat(64)}`,
+      policyVersion: 1,
+      engineVersion: '0.1.0',
     })
   })
 })
