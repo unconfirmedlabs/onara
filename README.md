@@ -142,6 +142,20 @@ format, endpoint contract, and operational details.
 
 ## Run locally
 
+Successful `/status` and `/readyz` responses include `policyDigest`,
+`policyVersion`, and `engineVersion`. Compare the deployment's policy digest
+with your local configuration without publishing the policies:
+
+```bash
+bun run onara policy-digest /path/to/config.json
+```
+
+The digest covers the full versioned JSON configuration with sorted object
+keys and preserved array order. It excludes environment settings and engine
+code; compare `engineVersion` separately. See the
+[policy digest contract](./api/README.md#policy-identity) for canonicalization
+and privacy details.
+
 Requirements: [Bun](https://bun.sh) and a Sui RPC endpoint. Wrangler is also
 required when using the Cloudflare adapter.
 

@@ -1,5 +1,8 @@
 import { SuiGrpcClient } from '@mysten/sui/grpc'
-import { loadPolicies, type CompiledPolicies } from '../policy'
+import type { CompiledPolicies } from '../policy'
+import type { OnaraConfig } from './config'
+import { loadPolicyConfig } from './policy-digest'
+import { version as engineVersion } from '../../package.json'
 import { parseGasBudgetMax } from '../gas-budget'
 import { parseSponsorKeypair } from '../sponsor-key'
 
@@ -30,22 +33,27 @@ export type OnaraRuntime = {
   keypair: ReturnType<typeof parseSponsorKeypair>
   sponsorAddress: string
   policies: CompiledPolicies
+  config: OnaraConfig
+  policyDigest: string
+  policyVersion: OnaraConfig['version']
+  engineVersion: string
   gasBudgetMax: bigint | null
   forceValidateOnly: boolean
 }
 
 export function createOnaraRuntime({
   environment,
-  policies,
+  config,
 }: {
   environment: OnaraEnvironment
-  policies: readonly unknown[]
+  config: unknown
 }): OnaraRuntime {
   const SUI_GRPC_URL = requiredEnvironmentValue(environment, 'SUI_GRPC_URL')
   const SUI_NETWORK = requiredEnvironmentValue(environment, 'SUI_NETWORK')
   const SUI_CHAIN_ID = requiredEnvironmentValue(environment, 'SUI_CHAIN_ID')
   const SUI_PRIVATE_KEY = requiredEnvironmentValue(environment, 'SUI_PRIVATE_KEY')
-  const compiledPolicies = loadPolicies([...policies])
+  const policyConfig = loadPolicyConfig(config)
+  const compiledPolicies = policyConfig.policies
   const gasBudgetMax = parseGasBudgetMax(environment.GAS_BUDGET_MAX)
 
   if (
@@ -71,7 +79,8 @@ export function createOnaraRuntime({
     client: new SuiGrpcClient({ network: SUI_NETWORK, baseUrl: SUI_GRPC_URL }),
     keypair,
     sponsorAddress: keypair.toSuiAddress(),
-    policies: compiledPolicies,
+    ...policyConfig,
+    engineVersion,
     gasBudgetMax,
     forceValidateOnly:
       environment.DRY_RUN_ONLY === 'true' || environment.DRY_RUN_ONLY === '1',

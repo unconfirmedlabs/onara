@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test'
+import { computePolicyDigest } from './policy-digest'
+import { version } from '../../package.json'
 import {
   assertOnaraRuntimeChainId,
   createOnaraRuntime,
@@ -22,17 +24,18 @@ const policies = [
     calls: { mode: 'set', rules: [{ id: 'all', targets: ['*'] }] },
   },
 ]
+const config = { version: 1 as const, policies }
 
 describe('Onara runtime', () => {
   test('requires an explicit expected chain identifier', () => {
     const { SUI_CHAIN_ID: _, ...withoutChainId } = environment
     expect(() =>
-      createOnaraRuntime({ environment: withoutChainId, policies }),
+      createOnaraRuntime({ environment: withoutChainId, config }),
     ).toThrow('SUI_CHAIN_ID must be configured.')
   })
 
   test('rejects an RPC endpoint on the wrong chain', async () => {
-    const runtime = createOnaraRuntime({ environment, policies })
+    const runtime = createOnaraRuntime({ environment, config })
     Object.assign(runtime.client.core, {
       getChainIdentifier: async () => ({ chainIdentifier: 'wrong-chain' }),
     })
@@ -43,11 +46,33 @@ describe('Onara runtime', () => {
   })
 
   test('accepts an RPC endpoint on the configured chain', async () => {
-    const runtime = createOnaraRuntime({ environment, policies })
+    const runtime = createOnaraRuntime({ environment, config })
     Object.assign(runtime.client.core, {
       getChainIdentifier: async () => ({ chainIdentifier: 'test-chain' }),
     })
 
     await expect(assertOnaraRuntimeChainId(runtime)).resolves.toBe('test-chain')
+  })
+
+  test('retains a frozen raw snapshot and hashes independently of environment', () => {
+    const input = structuredClone(config)
+    const runtime = createOnaraRuntime({ environment, config: input })
+    const digest = computePolicyDigest(input)
+    input.policies[0]!.name = 'changed after initialization'
+    expect(runtime.config).toEqual(config)
+    expect(Object.isFrozen(runtime.config.policies[0])).toBe(true)
+    expect(runtime.policyDigest).toBe(digest)
+    expect(runtime.policyVersion).toBe(1)
+    expect(runtime.engineVersion).toBe(version)
+    expect(createOnaraRuntime({
+      environment: { ...environment, GAS_BUDGET_MAX: '2', DRY_RUN_ONLY: 'true' },
+      config,
+    }).policyDigest).toBe(digest)
+  })
+
+  test('requires the complete valid envelope and policies', () => {
+    for (const invalid of [policies, { policies }, { ...config, version: 2 }, { version: 1, policies: [{}] }]) {
+      expect(() => createOnaraRuntime({ environment, config: invalid })).toThrow()
+    }
   })
 })

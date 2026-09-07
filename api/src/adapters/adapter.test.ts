@@ -4,6 +4,10 @@ import { tmpdir } from 'node:os'
 import { describe, expect, test } from 'bun:test'
 import { createBunRuntime } from './bun/runtime'
 import { createCloudflareRuntime } from './cloudflare/runtime'
+import sponsorConfig from '../../policies'
+import { computePolicyDigest } from '../core/policy-digest'
+import { generatePoliciesIndex } from './cloudflare/deploy'
+import { createOnaraRuntime } from '../core/runtime'
 
 const environment = {
   SUI_NETWORK: 'testnet',
@@ -24,22 +28,11 @@ describe('platform adapters', () => {
     const configPath = join(directory, 'config.json')
     writeFileSync(
       configPath,
-      JSON.stringify({
-        version: 1,
-        policies: [
-          {
-            type: 'allow',
-            name: 'allow-all',
-            gasBudgetMax: '1',
-            commands: { allowed: ['MoveCall'] },
-            calls: { mode: 'set', rules: [{ id: 'all', targets: ['*'] }] },
-          },
-        ],
-      }),
+      JSON.stringify(sponsorConfig),
     )
 
     try {
-    const cloudflare = createCloudflareRuntime(environment)
+      const cloudflare = createCloudflareRuntime(environment)
       const bun = createBunRuntime({ ...environment, ONARA_CONFIG_PATH: configPath })
 
       expect(cloudflare.environment.SUI_NETWORK).toBe(bun.environment.SUI_NETWORK)
@@ -47,9 +40,34 @@ describe('platform adapters', () => {
       expect(cloudflare.environment.SUI_GRPC_URL).toBe(bun.environment.SUI_GRPC_URL)
       expect(cloudflare.sponsorAddress).toBe(bun.sponsorAddress)
       expect(cloudflare.gasBudgetMax).toBe(bun.gasBudgetMax)
+      expect(cloudflare.config).toEqual(bun.config)
+      expect(cloudflare.policyVersion).toBe(1)
+      expect(cloudflare.engineVersion).toBe(bun.engineVersion)
+      expect(cloudflare.policyDigest).toBe(computePolicyDigest(sponsorConfig))
+      expect(cloudflare.policyDigest).toBe(bun.policyDigest)
       expect(cloudflare.policies.allow.map((policy) => policy.name)).toEqual(
         bun.policies.allow.map((policy) => policy.name),
       )
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('generated Cloudflare registry retains the complete external config', async () => {
+    const config = {
+      version: 1 as const,
+      policies: [{ type: 'deny', name: 'external', enabled: false, when: { kind: 'always' } }],
+    }
+    const directory = mkdtempSync(join(tmpdir(), 'onara-generated-registry-'))
+    try {
+      const path = join(directory, 'index.ts')
+      writeFileSync(path, generatePoliciesIndex(config))
+      const generated = await import(path)
+      expect(generated.default).toEqual(config)
+      const runtime = createOnaraRuntime({ environment, config: generated.default })
+      expect(runtime.policyDigest).toBe(computePolicyDigest(config))
+      expect(runtime.policyVersion).toBe(1)
+      expect(() => generatePoliciesIndex({ version: 1, policies: [{}] })).toThrow()
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }
