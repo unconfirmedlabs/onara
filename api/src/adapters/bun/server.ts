@@ -21,7 +21,9 @@ const server = Bun.serve({
 
 console.log(`Onara Bun adapter listening on http://${server.hostname}:${server.port}`)
 
-const shutdown = createGracefulShutdown(server)
+const shutdown = createGracefulShutdown(server, {
+  dispose: () => runtime.effectRuntime.dispose(),
+})
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.once(signal, () => shutdown(signal))
 }

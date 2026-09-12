@@ -1,4 +1,7 @@
 import { SuiGrpcClient } from '@mysten/sui/grpc'
+import { Layer, ManagedRuntime } from 'effect'
+import { Sui, SuiCore } from '@unconfirmed/sui-effect'
+import { Journal, Signer, type Signer as EffectSigner } from '@unconfirmed/sui-effect/tx'
 import type { CompiledPolicies } from '../policy'
 import type { OnaraConfig } from './config'
 import { loadPolicyConfig } from './policy-digest'
@@ -31,6 +34,9 @@ export type OnaraRuntime = {
     >
   client: SuiGrpcClient
   keypair: ReturnType<typeof parseSponsorKeypair>
+  sponsorSigner: EffectSigner
+  /** One reusable Effect runtime for all requests handled by this isolate. */
+  effectRuntime: ManagedRuntime.ManagedRuntime<Sui, never>
   sponsorAddress: string
   policies: CompiledPolicies
   config: OnaraConfig
@@ -68,6 +74,18 @@ export function createOnaraRuntime({
   }
 
   const keypair = parseSponsorKeypair(SUI_PRIVATE_KEY)
+  const sponsorSigner = Signer.fromSdkSigner(keypair)
+  const client = new SuiGrpcClient({ network: SUI_NETWORK, baseUrl: SUI_GRPC_URL })
+  const effectRuntime = ManagedRuntime.make(
+    Layer.mergeAll(
+      Sui.layerNoDepsPinned(SUI_CHAIN_ID).pipe(
+        Layer.provide(SuiCore.layerFromClient(
+          client,
+        )),
+      ),
+      Journal.layerMemory,
+    ),
+  )
   return {
     environment: {
       ...environment,
@@ -76,8 +94,10 @@ export function createOnaraRuntime({
       SUI_CHAIN_ID,
       SUI_PRIVATE_KEY,
     },
-    client: new SuiGrpcClient({ network: SUI_NETWORK, baseUrl: SUI_GRPC_URL }),
+    client,
     keypair,
+    sponsorSigner,
+    effectRuntime,
     sponsorAddress: keypair.toSuiAddress(),
     ...policyConfig,
     engineVersion,
@@ -86,6 +106,7 @@ export function createOnaraRuntime({
       environment.DRY_RUN_ONLY === 'true' || environment.DRY_RUN_ONLY === '1',
   }
 }
+
 
 /**
  * Proves that the configured RPC endpoint belongs to the intended chain.

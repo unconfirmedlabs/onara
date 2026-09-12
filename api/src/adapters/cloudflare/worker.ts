@@ -38,7 +38,10 @@ export default {
           error: error instanceof Error ? error.message : String(error),
         }),
       )
-      return Response.json({ error: 'Onara is not ready.' }, { status: 503 })
+      return Response.json(
+        { error: 'Onara is not ready.', outcome: 'not_applied' as const },
+        { status: 503 },
+      )
     }
     return worker.app.fetch(request, bindings)
   },

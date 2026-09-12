@@ -32,7 +32,7 @@ SDK releases are published from `sdk-v*` tags using npm trusted publishing.
 ## Use the SDK
 
 ```bash
-bun add @unconfirmed/onara @mysten/sui
+bun add @unconfirmed/onara @mysten/bcs@2.1.1 @mysten/sui@2.30.0 @unconfirmed/sui-effect@^0.1.2 effect@4.0.0-rc.112
 ```
 
 Register Onara as a Sui client extension:
@@ -65,7 +65,14 @@ owner, forces an empty gas payment so only the sponsor's address balance can be
 used, builds with the registered Sui client, collects the sender signature, and
 submits the sponsorship request. The sender's key never leaves the client.
 
-See [`sdk/README.md`](./sdk/README.md) for the standalone client, dry runs,
+The SDK is an Effect service under the Promise face exposed by `$extend`. The
+Effect migration removes the URL-only `new OnaraClient(...)` constructor:
+use `$extend(onara({ url }))` for Promise code or provide `Onara.layer({ url })`
+in an Effect application. Execution results are decoded `Executed` values;
+ambiguous submissions raise `SubmissionUnknown`, while an on-chain failure is
+an applied `ExecutionFailed` with status-recovery support.
+
+See [`sdk/README.md`](./sdk/README.md) for Effect layers, dry runs,
 transaction status recovery, and the full typed API.
 
 ## Policy model

@@ -105,6 +105,9 @@ export type SponsorshipRequest = {
 export type SponsorshipDependencies = {
   client: SuiGrpcClient
   keypair: Keypair
+  effectRuntime: import('effect').ManagedRuntime.ManagedRuntime<import('@unconfirmed/sui-effect').Sui, never>
+  sponsorSigner: import('@unconfirmed/sui-effect/tx').Signer
+  chainId: string
   sponsorAddress: string
   policies: CompiledPolicies
   gasBudgetMax: bigint | null
@@ -415,10 +418,16 @@ export async function sponsorRequest({
     throw failure('request-timeout', 'Sponsorship request timed out.')
   }
   const remainingExecutionMs = deadlineAt - Date.now()
+  // `executeTransaction` owns two distinct clocks: the remaining pre-submit /
+  // execute budget and the independent visibility budget. Do not wrap it in
+  // the preflight `deadlineAt` here, or a slow visibility read would abort the
+  // already-applied result and turn it into a 504 refusal.
   const outcome = await runStage('execution', onStage, () =>
     executeTransaction({
-      grpcClient: dependencies.client,
-      keypair: dependencies.keypair,
+      effectRuntime: dependencies.effectRuntime,
+      sponsorSigner: dependencies.sponsorSigner,
+      chainId: dependencies.chainId,
+      sender,
       txBytes: analysis.bytes,
       txSignature: request.payload.txSignature,
       waitForExecution: request.waitForExecution,

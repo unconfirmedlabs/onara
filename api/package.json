@@ -14,8 +14,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@mysten/sui": "^2.27.0",
+    "@mysten/bcs": "2.1.1",
+    "@mysten/sui": "2.30.0",
     "@noble/hashes": "^2.3.0",
+    "@unconfirmed/sui-effect": "^0.1.2",
+    "effect": "4.0.0-rc.112",
     "envalid": "^8.1.1",
     "hono": "^4.12.3",
     "p-retry": "^7.1.1",

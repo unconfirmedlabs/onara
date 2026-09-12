@@ -3,6 +3,15 @@ import type { SuiGrpcClient } from '@mysten/sui/grpc'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
 import { Transaction } from '@mysten/sui/transactions'
 import { toBase64 } from '@mysten/sui/utils'
+import { Effect, Layer, ManagedRuntime } from 'effect'
+import {
+  FakeOutcome,
+  layerTest,
+  SuiCoreFake,
+  fakeDigest,
+} from '@unconfirmed/sui-effect/testing'
+import { Journal, Signer } from '@unconfirmed/sui-effect/tx'
+import type { Sui } from '@unconfirmed/sui-effect'
 import { loadPolicies } from './policy'
 import {
   sponsorRequest,
@@ -23,6 +32,8 @@ const policies = loadPolicies([
     },
   },
 ])
+
+const CHAIN_ID = fakeDigest(41)
 
 async function fixture({
   mode,
@@ -47,41 +58,55 @@ async function fixture({
   let simulationCalls = 0
   let executeCalls = 0
   let submittedBytes: Uint8Array | null = null
-  const client = {
-    core: {
-      getCurrentSystemState: async () => ({
-        systemState: { epoch: '1' },
-      }),
-      simulateTransaction: async () => {
-        simulationCalls++
-        if (simulation === 'unavailable') throw new Error('RPC unavailable')
-        if (simulation === 'failed') {
-          return {
-            $kind: 'FailedTransaction',
-            FailedTransaction: {
-              status: { error: { message: 'Move abort' } },
-            },
-          }
-        }
-        return { $kind: 'Transaction', Transaction: {} }
-      },
-      executeTransaction: async ({
-        transaction,
-      }: {
-        transaction: Uint8Array
-      }) => {
-        executeCalls++
-        submittedBytes = transaction
+  const script = {
+    network: 'devnet' as const,
+    chainId: CHAIN_ID,
+    epoch: 1n,
+    simulate: simulation === 'unavailable'
+      ? [FakeOutcome.transportError('UNAVAILABLE')]
+      : simulation === 'failed'
+        ? [FakeOutcome.failWith({
+            message: 'Move abort',
+            $kind: 'MoveAbort',
+            MoveAbort: { abortCode: '1' },
+          })]
+        : [FakeOutcome.succeed()],
+    execute: [FakeOutcome.succeed()],
+  }
+  const rawRuntime = ManagedRuntime.make(
+    Layer.mergeAll(layerTest(script), Journal.layerMemory),
+  )
+  const fake = await rawRuntime.runPromise(SuiCoreFake)
+  const client = fake.client as unknown as SuiGrpcClient
+  const originalSimulation = fake.client.core.simulateTransaction
+  const originalExecute = fake.client.core.executeTransaction
+  Object.assign(fake.client.core, {
+    simulateTransaction: async (options: Parameters<typeof originalSimulation>[0]) => {
+      simulationCalls++
+      if (simulation === 'failed') {
         return {
-          $kind: 'Transaction',
-          Transaction: { digest: 'digest' },
-        }
-      },
+          $kind: 'FailedTransaction',
+          FailedTransaction: {
+            status: { error: { message: 'Move abort' } },
+          },
+        } as Awaited<ReturnType<typeof originalSimulation>>
+      }
+      return originalSimulation(options)
     },
-  } as unknown as SuiGrpcClient
+    executeTransaction: async (options: Parameters<typeof originalExecute>[0]) => {
+      executeCalls++
+      submittedBytes = options.transaction
+      return originalExecute(options)
+    },
+  })
+  const sponsorSigner = Signer.fromSdkSigner(sponsor)
+  const effectRuntime = rawRuntime as ManagedRuntime.ManagedRuntime<Sui, never>
   const dependencies: SponsorshipDependencies = {
     client,
     keypair: sponsor,
+    effectRuntime,
+    sponsorSigner,
+    chainId: CHAIN_ID,
     sponsorAddress: sponsor.toSuiAddress(),
     policies,
     gasBudgetMax: null,
@@ -89,7 +114,11 @@ async function fixture({
   }
   const stages: string[] = []
 
-  const run = (executionTimeoutMs = 3_000) =>
+  const run = (
+    executionTimeoutMs = 3_000,
+    waitForExecution = false,
+    confirmationTimeoutMs = 1_000,
+  ) =>
     sponsorRequest({
       request: {
         payload: {
@@ -98,9 +127,9 @@ async function fixture({
           txSignature: signature,
         },
         mode,
-        waitForExecution: false,
+        waitForExecution,
         executionTimeoutMs,
-        confirmationTimeoutMs: 1_000,
+        confirmationTimeoutMs,
       },
       dependencies,
       onStage: (stage, phase) => stages.push(`${stage}:${phase}`),
@@ -120,6 +149,7 @@ async function fixture({
     get submittedBytes() {
       return submittedBytes
     },
+    dispose: () => rawRuntime.dispose(),
   }
 }
 
@@ -302,5 +332,19 @@ describe('sponsorRequest', () => {
     await expect(test.run(25)).rejects.toMatchObject({
       kind: 'request-timeout',
     })
+  })
+
+  test('lets the independent visibility budget outlive the pre-submit deadline', async () => {
+    const test = await fixture({ mode: 'execute' })
+    Object.assign(test.dependencies.client.core, {
+      waitForTransaction: ({ signal }: { signal?: AbortSignal }) =>
+        new Promise((_, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        }),
+    })
+
+    const result = await test.run(100, true, 150)
+    expect(result.kind).toBe('executed')
+    if (result.kind === 'executed') expect(result.outcome.kind).toBe('success')
   })
 })

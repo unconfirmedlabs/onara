@@ -46,4 +46,30 @@ describe('Bun graceful shutdown', () => {
 
     expect(calls).toEqual([undefined])
   })
+
+  test('disposes the Effect runtime only after the server has drained', async () => {
+    let finishDrain: (() => void) | undefined
+    const draining = new Promise<void>((resolve) => {
+      finishDrain = resolve
+    })
+    let disposed = false
+    const shutdown = createGracefulShutdown(
+      { stop: () => draining },
+      {
+        gracePeriodMs: 1_000,
+        dispose: async () => {
+          disposed = true
+        },
+        log: { log: () => {}, error: () => {} },
+      },
+    )
+
+    shutdown('SIGTERM')
+    await Promise.resolve()
+    expect(disposed).toBe(false)
+    finishDrain?.()
+    await draining
+    await Promise.resolve()
+    expect(disposed).toBe(true)
+  })
 })

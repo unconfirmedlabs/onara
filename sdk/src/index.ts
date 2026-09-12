@@ -1,7 +1,10 @@
-export { OnaraClient, onara } from './client'
-export type { OnaraClientOptions, OnaraExtensionOptions } from './client'
-export { OnaraError } from './errors'
+export { Onara, onara } from './client'
+export type { OnaraClient, OnaraExtensionOptions, OnaraLayerOptions } from './client'
+export { OnaraError, OnaraOutcome, OnaraValidationOnly } from './errors'
 export type {
+  OnaraService,
+  OnaraRequestError,
+  OnaraTransactionError,
   StatusResponse,
   PolicyConfig,
   PolicyCommandKind,
@@ -15,6 +18,7 @@ export type {
   PolicyCalls,
   AllowPolicyConfig,
   SponsorOptions,
+  SponsorTransactionOptions,
   SponsorDryRunResponse,
   SponsorExecutionResponse,
   SponsorResponse,

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { TransactionError } from '@mysten/sui/client'
 import { createOnaraRuntime, type OnaraRuntime } from './core/runtime'
 import { createOnaraApp } from './http/app'
 import sponsorPolicies from '../policies'
@@ -94,11 +95,44 @@ describe('HTTP surface', () => {
     const ready = await app.request('/readyz')
     expect(ready.status).toBe(503)
     expect(ready.headers.get('Cache-Control')).toBe('no-store')
-    expect(await ready.json()).toEqual({ status: 'not-ready' })
+    expect(await ready.json()).toEqual({ status: 'not-ready', outcome: 'not_applied' })
 
     const status = await app.request('/status')
     expect(status.status).toBe(503)
     expect(status.headers.get('Cache-Control')).toBe('no-store')
-    expect(await status.json()).toEqual({ error: 'Onara is not ready.' })
+    expect(await status.json()).toEqual({ error: 'Onara is not ready.', outcome: 'not_applied' })
+  })
+
+  test('distinguishes a real missing transaction from a status RPC outage', async () => {
+    const digest = '69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD'
+    const missingRuntime = runtime()
+    Object.assign(missingRuntime.client, {
+      getTransaction: async () => {
+        throw new TransactionError('notFound', digest)
+      },
+    })
+    const missing = await createOnaraApp(missingRuntime).request(
+      `/sponsor/${digest}/status`,
+    )
+    expect(missing.status).toBe(404)
+    expect(await missing.json()).toEqual({ found: false, digest })
+
+    const outageRuntime = runtime()
+    Object.assign(outageRuntime.client, {
+      getTransaction: async () => {
+        throw new Error('RPC unavailable')
+      },
+    })
+    const outage = await createOnaraApp(outageRuntime).request(
+      `/sponsor/${digest}/status`,
+    )
+    expect(outage.status).toBe(503)
+    expect(await outage.json()).toEqual({
+      error: 'Unable to look up transaction status.',
+      outcome: 'unknown',
+      digest,
+    })
+    await missingRuntime.effectRuntime.dispose()
+    await outageRuntime.effectRuntime.dispose()
   })
 })

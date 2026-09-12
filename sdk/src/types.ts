@@ -1,14 +1,38 @@
+import type { Transaction } from '@mysten/sui/transactions'
+import type { Signer as SdkSigner } from '@mysten/sui/cryptography'
+import type { ClientWithCoreApi } from '@mysten/sui/client'
+import type { Effect } from 'effect'
+import type {
+  BuildError,
+  DecodeError,
+  ExecutionFailed,
+  JournalError,
+  NetworkMismatch,
+  NotApplied,
+  SimulationFailed,
+  SigningError,
+  SubmissionUnknown,
+  TransportError,
+} from '@unconfirmed/sui-effect'
+import type { Executed, Recipe } from '@unconfirmed/sui-effect'
+import type { Signer as EffectSigner } from '@unconfirmed/sui-effect/tx'
+import type { OnaraValidationOnly } from './errors'
+
 // ─── API Responses ───────────────────────────────────────────────────────────
 
+/** The decoded metadata returned by `GET /status`. */
 export type StatusResponse = {
-  network: string
-  chainId: string
-  address: string
-  balances: { active: string; pending: string }
+  readonly network: string
+  readonly chainId: string
+  readonly address: string
+  readonly balances: {
+    readonly active: string
+    readonly pending: string
+  }
   /** SHA-256 of the server's canonical policy configuration. */
-  policyDigest: string
-  policyVersion: number
-  engineVersion: string
+  readonly policyDigest: string
+  readonly policyVersion: number
+  readonly engineVersion: string
 }
 
 // ─── Policy Config Types (schema version 1) ──────────────────────────────────
@@ -23,118 +47,186 @@ export type PolicyCommandKind =
   | 'Upgrade'
 
 export type DenyPolicyWhen =
-  | { kind: 'always' }
-  | { kind: 'any-move-call'; targets: string[] }
-  | { kind: 'sender'; addresses: string[] }
+  | { readonly kind: 'always' }
+  | { readonly kind: 'any-move-call'; readonly targets: readonly string[] }
+  | { readonly kind: 'sender'; readonly addresses: readonly string[] }
 
 export type DenyPolicyConfig = {
-  type: 'deny'
-  name: string
-  enabled?: boolean
-  when: DenyPolicyWhen
+  readonly type: 'deny'
+  readonly name: string
+  readonly enabled?: boolean
+  readonly when: DenyPolicyWhen
 }
 
 export type PolicyCallCount =
-  | { min?: number; max?: number }
-  | { sameAs: string }
+  | { readonly min?: number; readonly max?: number }
+  | { readonly sameAs: string }
 
 export type PolicyCallRule = {
-  id: string
-  targets: string[]
-  count?: PolicyCallCount
+  readonly id: string
+  readonly targets: readonly string[]
+  readonly count?: PolicyCallCount
   /** Type-argument index to its complete allowed canonical-type set. */
-  typeArguments?: Record<string, string[]>
+  readonly typeArguments?: Readonly<Record<string, readonly string[]>>
 }
 
 export type PolicyOrderingRule = {
-  before: string
-  after: string
+  readonly before: string
+  readonly after: string
 }
 
 export type PolicyResultConsumer = {
-  rule: string
+  readonly rule: string
   /** Exact zero-based top-level Move-call argument index. */
-  argument: number
+  readonly argument: number
 }
 
 export type PolicyResultFlowRule = {
   /** Exact zero-based result slot on every occurrence of the producer rule. */
-  from: { rule: string; result: number }
-  to: PolicyResultConsumer[]
+  readonly from: { readonly rule: string; readonly result: number }
+  readonly to: readonly PolicyResultConsumer[]
   /** Omission means at least one exact allowed use is required. */
-  required?: boolean
+  readonly required?: boolean
 }
 
 export type PolicyCalls =
   | {
-      mode: 'set'
-      rules: PolicyCallRule[]
-      ordering?: PolicyOrderingRule[]
-      resultFlow?: PolicyResultFlowRule[]
+      readonly mode: 'set'
+      readonly rules: readonly PolicyCallRule[]
+      readonly ordering?: readonly PolicyOrderingRule[]
+      readonly resultFlow?: readonly PolicyResultFlowRule[]
     }
   | {
-      mode: 'sequence'
-      rules: PolicyCallRule[]
-      ordering?: never
-      resultFlow?: PolicyResultFlowRule[]
+      readonly mode: 'sequence'
+      readonly rules: readonly PolicyCallRule[]
+      readonly ordering?: never
+      readonly resultFlow?: readonly PolicyResultFlowRule[]
     }
 
 export type AllowPolicyConfig = {
-  type: 'allow'
-  name: string
-  enabled?: boolean
-  senders?: string[]
-  suinsNames?: string[]
+  readonly type: 'allow'
+  readonly name: string
+  readonly enabled?: boolean
+  readonly senders?: readonly string[]
+  readonly suinsNames?: readonly string[]
   /** Positive decimal string in MIST. */
-  gasBudgetMax?: string
-  commands: {
-    allowed: PolicyCommandKind[]
-    max?: number
+  readonly gasBudgetMax?: string
+  readonly commands: {
+    readonly allowed: readonly PolicyCommandKind[]
+    readonly max?: number
   }
-  calls: PolicyCalls
+  readonly calls: PolicyCalls
 }
 
-export type PolicyConfig =
-  | DenyPolicyConfig
-  | AllowPolicyConfig
+export type PolicyConfig = DenyPolicyConfig | AllowPolicyConfig
 
 // ─── Sponsor Types ───────────────────────────────────────────────────────────
 
 export type SponsorOptions = {
-  sender: string
-  txBytes: string
-  txSignature: string
-  dryRun?: boolean
-  waitForExecution?: boolean
+  readonly sender: string
+  /** Base64 encoded BCS `TransactionData` bytes. */
+  readonly txBytes: string
+  /** Base64 encoded sender signature. */
+  readonly txSignature: string
+  readonly dryRun?: boolean
+  readonly waitForExecution?: boolean
   /**
    * @deprecated Onara always runs pre-flight simulation before sponsoring.
    * This option remains for source compatibility and is ignored.
    */
-  simulate?: boolean
+  readonly simulate?: boolean
 }
 
 export type SponsorDryRunResponse = {
-  dryRun: true
-  policy: string
-  moveCallTargets: string[]
+  readonly dryRun: true
+  readonly policy: string
+  readonly moveCallTargets: readonly string[]
 }
 
-export type SponsorExecutionResponse = Record<string, unknown>
+/** A transaction that reached Sui, with decoded effects and execution evidence. */
+export type SponsorExecutionResponse = Executed
 
 export type SponsorResponse = SponsorDryRunResponse | SponsorExecutionResponse
 
-// ─── Transaction Status Types ───────────────────────────────────────────────
-
-export type TransactionStatusResponse = {
-  found: boolean
-  digest?: string
-  [key: string]: unknown
+export type SponsorTransactionOptions = {
+  /** A composable recipe or an SDK transaction whose bytes will be signed once. */
+  readonly transaction: Transaction | Recipe
+  /** An effect signer, or an existing Mysten SDK signer adapted at the boundary. */
+  readonly signer: EffectSigner | SdkSigner
+  /** Sui client used to build the transaction; defaults to the registered client. */
+  readonly client?: ClientWithCoreApi
+  readonly dryRun?: boolean
+  readonly waitForExecution?: boolean
+  /** @deprecated Onara always simulates before sponsoring; this is ignored. */
+  readonly simulate?: boolean
 }
 
-// ─── Error Types ─────────────────────────────────────────────────────────────
+export type OnaraRequestError = OnaraErrorResponseError | DecodeError | TransportError
 
+export type OnaraSponsorError =
+  | OnaraRequestError
+  | NetworkMismatch
+  | ExecutionFailed
+  | NotApplied
+  | SubmissionUnknown
+  | JournalError
+
+export type OnaraTransactionError =
+  | OnaraRequestError
+  | NetworkMismatch
+  | BuildError
+  | SimulationFailed
+  | SigningError
+  | JournalError
+  | ExecutionFailed
+  | NotApplied
+  | SubmissionUnknown
+  | OnaraValidationOnly
+
+/** Error response fields accepted from an Onara HTTP endpoint. */
 export type OnaraErrorResponse = {
-  error: string
-  digest?: string
-  status?: 'unconfirmed' | 'unknown'
+  readonly error: string
+  readonly digest?: string
+  /** Legacy submit status retained for consumers migrating from 0.2.x. */
+  readonly status?: 'unconfirmed' | 'unknown'
+  readonly txStatus?: 'unconfirmed' | 'unknown'
+  readonly outcome?: 'not_applied' | 'unknown' | 'applied'
 }
+
+/** The SDK's tagged HTTP-domain error, exported from `errors.ts`. */
+export type OnaraErrorResponseError = import('./errors').OnaraError
+
+/** Public Effect service shape. */
+export interface OnaraService {
+  /** Read sponsor metadata. Fails with `OnaraError`, `DecodeError`, `TransportError`. */
+  readonly status: Effect.Effect<StatusResponse, OnaraRequestError>
+  /**
+   * Submit exact pre-built bytes. Fails with `OnaraError`, `DecodeError`,
+   * `TransportError`, `NetworkMismatch`, `ExecutionFailed`, `NotApplied`,
+   * `SubmissionUnknown`, and transaction lifecycle errors.
+   */
+  readonly sponsor: (
+    options: SponsorOptions,
+  ) => Effect.Effect<SponsorResponse, OnaraSponsorError>
+  /**
+   * Build and sign a recipe or transaction, then submit it through Onara.
+   * Fails with the same closed union as `sponsor`, plus `BuildError`,
+   * `SimulationFailed`, `SigningError`, and `JournalError`.
+   */
+  readonly sponsorTransaction: (
+    options: SponsorTransactionOptions,
+  ) => Effect.Effect<SponsorResponse, OnaraTransactionError>
+  /**
+   * Recover a transaction status. A 404 is a typed `found:false` result only
+   * when the endpoint explicitly returns that not-found response; other
+   * failures propagate `OnaraError`, `DecodeError`, or `TransportError`.
+   */
+  readonly getTransactionStatus: (
+    digest: string,
+  ) => Effect.Effect<TransactionStatusResponse, OnaraRequestError>
+}
+
+export type TransactionStatusResponse =
+  | { readonly found: false; readonly digest: string }
+  | { readonly found: true; readonly digest: string; readonly result: Executed }
+  | { readonly found: true; readonly digest: string; readonly failure: ExecutionFailed }

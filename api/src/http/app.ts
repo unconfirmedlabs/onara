@@ -13,7 +13,14 @@ import {
   type SponsorshipDependencies,
   type SponsorshipStage,
 } from '../sponsorship-service'
-import { isValidSuiAddress } from '@mysten/sui/utils'
+import { isValidSuiAddress, toBase64 } from '@mysten/sui/utils'
+import type { SuiClientTypes } from '@mysten/sui/client'
+import { Schema } from 'effect'
+import {
+  DecodeError,
+  Executed,
+  ExecutionFailed,
+} from '@unconfirmed/sui-effect'
 
 const DEFAULT_EXECUTION_TIMEOUT_MS = 45_000
 const DEFAULT_CONFIRMATION_TIMEOUT_MS = 30_000
@@ -46,6 +53,65 @@ const sponsorPayloadSchema = z.object({
     .regex(base64Regex, 'Invalid base64 payload.'),
 })
 
+const statusInclude = {
+  effects: true,
+  events: true,
+  balanceChanges: true,
+  objectTypes: true,
+} as const
+
+async function encodeTransactionResult(
+  runtime: OnaraRuntime,
+  result: SuiClientTypes.TransactionResult<typeof statusInclude>,
+): Promise<Record<string, unknown>> {
+  try {
+    const executed = await runtime.effectRuntime.runPromise(
+      Executed.fromTransactionResult(result),
+    )
+    return encodeExecutedJson(executed)
+  } catch (error) {
+    if (error instanceof ExecutionFailed) {
+      const failure = encodeExecutionFailedJson(error)
+      return {
+        error: error.message,
+        digest: error.digest,
+        outcome: 'applied',
+        failure,
+      }
+    }
+    throw error
+  }
+}
+
+function isTransactionNotFound(error: unknown): boolean {
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>
+    if (record._tag === 'TransactionNotFound') return true
+    if (record.reason === 'notFound') return true
+    if (record.status === 404 || record.code === 'NOT_FOUND' || record.code === 5) return true
+  }
+  return false
+}
+
+/** Encode the domain receipt into the JSON spellings accepted by Executed.fromPartial. */
+function encodeExecutedJson(executed: Executed): Record<string, unknown> {
+  const encoded = Schema.encodeUnknownSync(Executed)(executed) as Record<string, unknown>
+  const events = Array.isArray(encoded.events)
+    ? encoded.events.map((event) => {
+        if (event === null || typeof event !== 'object') return event
+        const value = event as Record<string, unknown>
+        return value.bcs instanceof Uint8Array
+          ? { ...value, bcs: toBase64(value.bcs) }
+          : value
+      })
+    : encoded.events
+  return { ...encoded, events }
+}
+
+function encodeExecutionFailedJson(error: ExecutionFailed): Record<string, unknown> {
+  return Schema.encodeUnknownSync(ExecutionFailed)(error) as Record<string, unknown>
+}
+
 export function createOnaraApp(
   runtime: OnaraRuntime,
   { readinessTimeoutMs = DEFAULT_READINESS_TIMEOUT_MS }: {
@@ -74,7 +140,7 @@ export function createOnaraApp(
       })
     } catch (error) {
       logReadinessFailure(error)
-      return c.json({ status: 'not-ready' }, 503)
+      return c.json({ status: 'not-ready', outcome: 'not_applied' as const }, 503)
     }
   })
 
@@ -105,7 +171,10 @@ export function createOnaraApp(
       })
     } catch (error) {
       logReadinessFailure(error)
-      return c.json({ error: 'Onara is not ready.' }, 503)
+      return c.json(
+        { error: 'Onara is not ready.', outcome: 'not_applied' as const },
+        503,
+      )
     }
   })
 
@@ -114,11 +183,29 @@ export function createOnaraApp(
     try {
       const tx = await runtime.client.getTransaction({
         digest,
-        include: { effects: true, events: true },
+        include: statusInclude,
       })
-      return c.json({ found: true, ...tx })
-    } catch {
-      return c.json({ found: false, digest }, 404)
+      const encoded = await encodeTransactionResult(runtime, tx)
+      return c.json({ found: true, ...encoded })
+    } catch (error) {
+      if (isTransactionNotFound(error)) {
+        return c.json({ found: false, digest }, 404)
+      }
+      console.error(
+        JSON.stringify({
+          message: 'Unable to look up transaction status.',
+          digest,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      return c.json(
+        {
+          error: 'Unable to look up transaction status.',
+          outcome: 'unknown' as const,
+          digest,
+        },
+        503,
+      )
     }
   })
 
@@ -137,28 +224,29 @@ export function createOnaraApp(
         c.req.query('confirmationTimeoutMs') ?? undefined,
       )
     } catch (error) {
-      return c.json(
-        {
-          error:
-            error instanceof Error
-              ? error.message
-              : 'Invalid sponsorship timeout configuration.',
-        },
-        500,
-      )
+        return c.json(
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Invalid sponsorship timeout configuration.',
+            outcome: 'not_applied' as const,
+          },
+          400,
+        )
     }
 
     let payload: unknown
     try {
       payload = await c.req.json()
     } catch {
-      return c.json({ error: 'Invalid JSON.' }, 400)
+      return c.json({ error: 'Invalid JSON.', outcome: 'not_applied' as const }, 400)
     }
 
     const parsed = sponsorPayloadSchema.safeParse(payload)
     if (!parsed.success) {
       const issue = parsed.error.issues[0]?.message ?? 'Invalid request payload.'
-      return c.json({ error: issue }, 400)
+      return c.json({ error: issue, outcome: 'not_applied' as const }, 400)
     }
 
     startTime(c, 'init', 'Client & keypair init')
@@ -183,7 +271,10 @@ export function createOnaraApp(
       })
     } catch (error) {
       if (error instanceof SponsorshipFailure) {
-        return c.json({ error: error.message }, sponsorshipHttpStatus(error))
+        return c.json(
+          { error: error.message, outcome: 'not_applied' as const },
+          sponsorshipHttpStatus(error),
+        )
       }
       console.error(
         JSON.stringify({
@@ -191,7 +282,10 @@ export function createOnaraApp(
           error: error instanceof Error ? error.message : String(error),
         }),
       )
-      return c.json({ error: 'Unable to process sponsorship request.' }, 500)
+      return c.json(
+        { error: 'Unable to process sponsorship request.', outcome: 'unknown' as const },
+        500,
+      )
     }
 
     const { metadata } = sponsorship
@@ -206,26 +300,63 @@ export function createOnaraApp(
     const outcome = sponsorship.outcome
     switch (outcome.kind) {
       case 'success':
-      case 'chain_failed': {
-        return c.json(outcome.result)
-      }
+        return c.json(encodeExecutedJson(outcome.result))
 
-      case 'confirmation_timeout':
-      case 'confirmation_error': {
+      case 'chain_failed': {
+        const encoded = encodeExecutionFailedJson(outcome.result)
         return c.json(
           {
-            error: outcome.error,
-            digest: outcome.digest,
-            status: 'unconfirmed' as const,
+            error: outcome.result.message,
+            digest: outcome.result.digest,
+            outcome: 'applied' as const,
+            failure: encoded,
           },
-          outcome.kind === 'confirmation_timeout' ? 504 : 502,
+          502,
         )
       }
 
-      case 'execution_timeout':
+      case 'submission_unknown': {
+        return c.json(
+          {
+            error: outcome.error.message,
+            digest: outcome.error.digest,
+            status: 'unknown' as const,
+            outcome: 'unknown' as const,
+          },
+          502,
+        )
+      }
+
+      case 'not_applied': {
+        return c.json(
+          {
+            error: outcome.error.message,
+            outcome: 'not_applied' as const,
+          },
+          400,
+        )
+      }
+
+      case 'execution_timeout': {
+        return c.json(
+          {
+            error: outcome.error,
+            ...(outcome.digest === undefined ? {} : { digest: outcome.digest }),
+            outcome: 'not_applied' as const,
+          },
+          504,
+        )
+      }
+
       case 'execution_error': {
-        const httpStatus = outcome.kind === 'execution_timeout' ? 504 : 500
-        return c.json({ error: outcome.error, status: 'unknown' as const }, httpStatus)
+        return c.json(
+          {
+            error: outcome.error,
+            ...(outcome.digest === undefined ? {} : { digest: outcome.digest }),
+            outcome: 'not_applied' as const,
+          },
+          500,
+        )
       }
     }
   })
@@ -246,6 +377,9 @@ function sponsorshipDependenciesFor(runtime: OnaraRuntime): SponsorshipDependenc
   return {
     client: runtime.client,
     keypair: runtime.keypair,
+    effectRuntime: runtime.effectRuntime,
+    sponsorSigner: runtime.sponsorSigner,
+    chainId: runtime.environment.SUI_CHAIN_ID,
     sponsorAddress: runtime.sponsorAddress,
     policies: runtime.policies,
     gasBudgetMax: runtime.gasBudgetMax,

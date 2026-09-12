@@ -7,9 +7,12 @@ export function createGracefulShutdown(
   {
     gracePeriodMs = 25_000,
     log = console,
+    dispose,
   }: {
     gracePeriodMs?: number
     log?: Pick<Console, 'log' | 'error'>
+    /** Release request-scoped services after the server has drained. */
+    dispose?: () => Promise<void>
   } = {},
 ): (signal: string) => void {
   let shuttingDown = false
@@ -28,7 +31,8 @@ export function createGracefulShutdown(
 
     void server
       .stop()
-      .then(() => {
+      .then(async () => {
+        await dispose?.()
         clearTimeout(forceStop)
         log.log('Onara server stopped.')
       })

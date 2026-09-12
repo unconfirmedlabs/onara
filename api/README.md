@@ -34,7 +34,7 @@ bun run deploy:cloudflare
 | `SUI_CHAIN_ID` | Expected immutable chain identifier returned by `SUI_GRPC_URL`; startup fails if it differs. |
 | `SUI_PRIVATE_KEY` | Bech32 `suiprivkey...` for the sponsor keypair. |
 | `DRY_RUN_ONLY` | Set to `true` or `1` to force `/sponsor` into validate-only mode |
-| `EXECUTION_TIMEOUT_MS` | Overall preflight-through-submission deadline in ms (default: `45000`) |
+| `EXECUTION_TIMEOUT_MS` | Pre-submit and Sui execution deadline in ms (default: `45000`) |
 | `CONFIRMATION_TIMEOUT_MS` | Max confirmation wait in ms after submission (default: `30000`) |
 | `GAS_BUDGET_MAX` | Hard server-side cap on gas budget, as a decimal string in MIST (e.g. `"50000000"`). It may be omitted only when every enabled allow policy sets `gasBudgetMax`. Enforced before policy matching on `/sponsor`. |
 
@@ -242,7 +242,7 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 |---|---|---|---|
 | `waitForExecution` | `boolean` | `true` | Wait for transaction finality before responding |
 | `dryRun` | `boolean` | `false` | Validate against policies only—do not simulate, sponsor-sign, or submit |
-| `executionTimeoutMs` | `number` | `45000` | Preflight, simulation, sponsor-signing, and submission deadline (capped at server max) |
+| `executionTimeoutMs` | `number` | `45000` | Preflight, simulation, sponsor-signing, and Sui execution deadline (capped at server max) |
 | `confirmationTimeoutMs` | `number` | `30000` | Confirmation wait after submission (capped at server max) |
 
 **Request body:**
@@ -255,7 +255,25 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 }
 ```
 
-**Success response (normal):** the transaction execution result from the Sui SDK.
+**Success response (normal):** a JSON-safe `Executed` receipt. Effects, gas
+usage, events, and balance changes are decoded by the SDK; event `bcs` bytes are
+base64 strings on the wire.
+
+```json
+{
+  "digest": "<transaction-digest>",
+  "effects": {
+    "status": { "success": true },
+    "gasUsed": {
+      "computationCost": "11",
+      "storageCost": "22",
+      "storageRebate": "3",
+      "nonRefundableStorageFee": "4"
+    }
+  },
+  "events": [{ "eventType": "0x2::coin::TransferEvent", "bcs": "AQIDBA==" }]
+}
+```
 
 **Success response (`dryRun=true`):**
 
@@ -274,9 +292,27 @@ Validates, simulates, co-signs, and executes a sponsored transaction.
 
 ```json
 {
-  "error": "Transaction is not eligible for sponsorship."
+  "error": "Transaction is not eligible for sponsorship.",
+  "outcome": "not_applied"
 }
 ```
+
+Every error includes an `outcome` field. `not_applied` means validation,
+policy, simulation, or another pre-submit stage refused the request. `unknown`
+means the submission may have reached Sui and includes a digest when one is
+known. `applied` carries structured failure evidence for a transaction that
+reached Sui and failed on chain. A visibility timeout after a successful
+execution still returns the known `Executed` receipt; it is never relabeled as
+an ambiguous submission.
+
+### `GET /sponsor/:digest/status`
+
+The status endpoint returns `{ "found": true, ...receipt }` with the same
+JSON-safe `Executed` shape. If Sui reports a failed transaction, it returns
+`found:true`, `outcome:"applied"`, and a structured `failure` object. An
+actual missing transaction returns `{ "found": false, "digest": "..." }`
+with HTTP 404. RPC outages return HTTP 503 with `outcome:"unknown"`, so an
+outage is never mistaken for absence.
 
 Detailed policy mismatch diagnostics are written to server logs and are not
 included in the HTTP response.
@@ -515,9 +551,10 @@ The server retries transient failures on key RPC operations (1 retry, 2 attempts
 - **Transaction execution** — Sui deduplicates by tx digest, safe to retry; the
   sponsor signature is created once and reused across attempts
 
-Preflight RPCs, simulation, sponsor signing, and submission share the overall
+Preflight RPCs, simulation, sponsor signing, and Sui execution share the
 execution deadline (`EXECUTION_TIMEOUT_MS`). Confirmation is cancellation-safe
-and has its own `CONFIRMATION_TIMEOUT_MS` deadline.
+and has its own `CONFIRMATION_TIMEOUT_MS` deadline, which can outlive the
+pre-submit deadline after Sui has returned execution evidence.
 
 ## Pre-v1 migration examples
 
