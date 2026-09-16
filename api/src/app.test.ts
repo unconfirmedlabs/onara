@@ -2,6 +2,9 @@ import { describe, expect, test } from 'bun:test'
 import { createOnaraRuntime, type OnaraRuntime } from './core/runtime'
 import { createOnaraApp } from './http/app'
 import sponsorPolicies from '../policies'
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
+import { Transaction } from '@mysten/sui/transactions'
+import { toBase64 } from '@mysten/sui/utils'
 
 function runtime(): OnaraRuntime {
   return createOnaraRuntime({
@@ -18,6 +21,33 @@ function runtime(): OnaraRuntime {
 }
 
 describe('HTTP surface', () => {
+  test('pre-execution dependency failures explicitly certify no submission', async () => {
+    const appRuntime = runtime()
+    const sender = new Ed25519Keypair()
+    const tx = new Transaction()
+    tx.setSender(sender.toSuiAddress())
+    tx.setGasOwner(appRuntime.sponsorAddress)
+    tx.setGasPayment([])
+    tx.setGasBudget(1)
+    tx.setGasPrice(1)
+    tx.setExpiration({ Epoch: 2 })
+    tx.moveCall({ target: '0x2::coin::zero' })
+    const bytes = await tx.build()
+    const signed = await sender.signTransaction(bytes)
+    let executeCalls = 0
+    Object.assign(appRuntime.client.core, {
+      getCurrentSystemState: async () => { throw new Error('RPC unavailable') },
+      executeTransaction: async () => { executeCalls++; throw new Error('must not execute') },
+    })
+    const response = await createOnaraApp(appRuntime).request('/sponsor', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender: sender.toSuiAddress(), txBytes: toBase64(bytes), txSignature: signed.signature }),
+    })
+    expect(response.status).toBe(503)
+    expect(response.headers.get('X-Onara-Submission')).toBe('not-submitted')
+    expect(executeCalls).toBe(0)
+  })
   test('does not expose policy configuration', async () => {
     const app = createOnaraApp(runtime())
     const response = await app.request('/policies')

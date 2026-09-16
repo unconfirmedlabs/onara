@@ -183,7 +183,11 @@ export function createOnaraApp(
       })
     } catch (error) {
       if (error instanceof SponsorshipFailure) {
-        return c.json({ error: error.message }, sponsorshipHttpStatus(error))
+        // These failures originate exclusively before sign/execute. A 5xx
+        // here is retryable without implying that transaction bytes were sent.
+        return c.json({ error: error.message }, sponsorshipHttpStatus(error), {
+          'X-Onara-Submission': 'not-submitted',
+        })
       }
       console.error(
         JSON.stringify({
