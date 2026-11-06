@@ -114,6 +114,8 @@ export type AllowPolicyConfig = {
   readonly commands: {
     readonly allowed: readonly PolicyCommandKind[]
     readonly max?: number
+    /** Defaults to true: reject transactions with no MoveCall. */
+    readonly requireMoveCall?: boolean
   }
   readonly calls: PolicyCalls
 }

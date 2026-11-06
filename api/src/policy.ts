@@ -191,6 +191,7 @@ const allowPolicySchema = z
           .min(1)
           .refine(unique, 'commands.allowed must not contain duplicates.'),
         max: z.number().int().positive().optional(),
+        requireMoveCall: z.boolean().default(true),
       })
       .strict(),
     calls: z.discriminatedUnion('mode', [setCallsSchema, sequenceCallsSchema]),
@@ -343,6 +344,7 @@ export type CompiledAllowPolicy = {
   gasBudgetMax: bigint | null
   allowedCommandKinds: Set<PolicyCommandKind>
   maxCommands: number | null
+  requireMoveCall: boolean
   calls: CompiledCalls
 }
 
@@ -591,6 +593,7 @@ export function loadPolicies(rawConfigs: unknown[]): CompiledPolicies {
           : null,
         allowedCommandKinds: new Set(policy.commands.allowed),
         maxCommands: policy.commands.max ?? null,
+        requireMoveCall: policy.commands.requireMoveCall,
         calls: compileCalls(policy.calls, policy.name),
       }
     })
@@ -924,7 +927,7 @@ function validateAllowPolicy(
       throw new Error(`command kind not allowed: ${kind ?? 'Unknown'}.`)
     }
   }
-  if (moveCalls.length === 0) {
+  if (policy.requireMoveCall && moveCalls.length === 0) {
     throw new Error('must include at least one MoveCall.')
   }
   const matched = matchCalls(policy, moveCalls)

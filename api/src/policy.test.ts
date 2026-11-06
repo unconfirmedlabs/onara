@@ -898,3 +898,284 @@ describe('real policy/config integration', () => {
   })
 
 })
+
+describe('commands.requireMoveCall', () => {
+  const OWNED =
+    '0x0000000000000000000000000000000000000000000000000000000000000042'
+  const OWNED_COIN =
+    '0x0000000000000000000000000000000000000000000000000000000000000043'
+
+  function owned(tx: Transaction, objectId = OWNED) {
+    return tx.object(
+      Inputs.ObjectRef({ objectId, version: '1', digest: ZERO_DIGEST }),
+    )
+  }
+
+  function noMoveCall(overrides: Record<string, unknown> = {}) {
+    return allow({
+      commands: {
+        allowed: ['TransferObjects', 'SplitCoins'],
+        requireMoveCall: false,
+      },
+      ...overrides,
+    })
+  }
+
+  function bareTransfer() {
+    return buildTxBytes((tx) => tx.transferObjects([owned(tx)], SENDER))
+  }
+
+  test('defaults to true, accepts false, and rejects non-boolean values', () => {
+    expect(loadPolicies([allow()]).allow[0]!.requireMoveCall).toBe(true)
+    expect(
+      loadPolicies([
+        allow({ commands: { allowed: ['MoveCall'], requireMoveCall: true } }),
+      ]).allow[0]!.requireMoveCall,
+    ).toBe(true)
+    expect(loadPolicies([noMoveCall()]).allow[0]!.requireMoveCall).toBe(false)
+    for (const value of ['false', 'true', 0, 1, null, {}]) {
+      expect(() =>
+        loadPolicies([
+          allow({
+            commands: { allowed: ['MoveCall'], requireMoveCall: value },
+          }),
+        ]),
+      ).toThrow(/requireMoveCall/)
+    }
+  })
+
+  test('the default still rejects a transaction without a MoveCall', async () => {
+    const policies = loadPolicies([
+      allow({ commands: { allowed: ['MoveCall', 'TransferObjects'] } }),
+    ])
+    const txBytes = await bareTransfer()
+    expect(() => validate(txBytes, policies)).toThrow(
+      /must include at least one MoveCall/,
+    )
+  })
+
+  test('false sponsors bare native-command transactions', async () => {
+    const transferOnly = loadPolicies([
+      noMoveCall({
+        commands: { allowed: ['TransferObjects'], requireMoveCall: false },
+      }),
+    ])
+    expect(branchNames(validate(await bareTransfer(), transferOnly))).toEqual([
+      'allow',
+    ])
+
+    const allKinds = loadPolicies([
+      noMoveCall({
+        commands: {
+          allowed: [
+            'MoveCall',
+            'TransferObjects',
+            'SplitCoins',
+            'MergeCoins',
+            'MakeMoveVec',
+          ],
+          requireMoveCall: false,
+        },
+      }),
+    ])
+    expect(branchNames(validate(await bareTransfer(), allKinds))).toEqual([
+      'allow',
+    ])
+
+    const split = await buildTxBytes((tx) => {
+      const [coin] = tx.splitCoins(owned(tx, OWNED_COIN), [100])
+      tx.transferObjects([coin!], SENDER)
+    })
+    expect(branchNames(validate(split, loadPolicies([noMoveCall()])))).toEqual(
+      ['allow'],
+    )
+    expect(branchNames(validate(split, allKinds))).toEqual(['allow'])
+  })
+
+  test('false still enforces command kinds and max', async () => {
+    const transferOnly = loadPolicies([
+      noMoveCall({
+        commands: { allowed: ['TransferObjects'], requireMoveCall: false },
+      }),
+    ])
+    const split = await buildTxBytes((tx) => {
+      const [coin] = tx.splitCoins(owned(tx, OWNED_COIN), [100])
+      tx.transferObjects([coin!], SENDER)
+    })
+    expect(() => validate(split, transferOnly)).toThrow(
+      /command kind not allowed: SplitCoins/,
+    )
+
+    const maxOne = loadPolicies([
+      noMoveCall({
+        commands: {
+          allowed: ['TransferObjects', 'SplitCoins'],
+          max: 1,
+          requireMoveCall: false,
+        },
+      }),
+    ])
+    expect(branchNames(validate(await bareTransfer(), maxOne))).toEqual([
+      'allow',
+    ])
+    expect(() => validate(split, maxOne)).toThrow(/too many commands/)
+  })
+
+  test('call rules still evaluate over zero MoveCalls', async () => {
+    const txBytes = await bareTransfer()
+    const withCalls = (calls: Record<string, unknown>) =>
+      loadPolicies([noMoveCall({ calls })])
+
+    expect(() =>
+      validate(
+        txBytes,
+        withCalls({
+          mode: 'set',
+          rules: [{ id: 'a', targets: [`${PKG}::m::a`], count: { min: 1 } }],
+        }),
+      ),
+    ).toThrow(/expected at least 1 calls, found 0/)
+
+    for (const calls of [
+      {
+        mode: 'set',
+        rules: [{ id: 'a', targets: [`${PKG}::m::a`], count: { max: 2 } }],
+      },
+      { mode: 'set', rules: [{ id: 'a', targets: [`${PKG}::m::a`] }] },
+      {
+        mode: 'set',
+        rules: [
+          { id: 'a', targets: [`${PKG}::m::a`] },
+          { id: 'b', targets: [`${PKG}::m::b`], count: { sameAs: 'a' } },
+        ],
+        ordering: [{ before: 'a', after: 'b' }],
+      },
+      {
+        mode: 'sequence',
+        rules: [
+          { id: 'a', targets: [`${PKG}::m::a`], count: { min: 0 } },
+          {
+            id: 'b',
+            targets: [`${PKG}::m::b`],
+            count: { min: 0, max: 1 },
+          },
+        ],
+      },
+    ]) {
+      expect(branchNames(validate(txBytes, withCalls(calls)))).toEqual([
+        'allow',
+      ])
+    }
+
+    expect(() =>
+      validate(
+        txBytes,
+        withCalls({
+          mode: 'sequence',
+          rules: [
+            { id: 'a', targets: [`${PKG}::m::a`], count: { min: 0 } },
+            { id: 'b', targets: [`${PKG}::m::b`] },
+          ],
+        }),
+      ),
+    ).toThrow(/expected exactly 1 call, found 0/)
+  })
+
+  test('result flow is vacuous without MoveCalls and unchanged with them', async () => {
+    const base = flowPolicy({ required: true })
+    const policies = loadPolicies([
+      {
+        ...base,
+        commands: {
+          allowed: ['MoveCall', 'TransferObjects'],
+          max: 10,
+          requireMoveCall: false,
+        },
+      },
+    ])
+    expect(branchNames(validate(await bareTransfer(), policies))).toEqual([
+      'allow',
+    ])
+
+    const unconsumed = await buildTxBytes((tx) =>
+      tx.moveCall({ target: `${PKG}::flow::produce` }),
+    )
+    expect(() => validate(unconsumed, policies)).toThrow(/must be consumed/)
+
+    const consumed = await buildTxBytes((tx) => {
+      const produced = tx.moveCall({ target: `${PKG}::flow::produce` })
+      tx.moveCall({ target: `${PKG}::flow::consume`, arguments: [produced] })
+    })
+    expect(branchNames(validate(consumed, policies))).toEqual(['allow'])
+  })
+
+  test('sponsor-only-gas invariants still apply without MoveCalls', async () => {
+    const policies = loadPolicies([noMoveCall()])
+
+    const gasCoin = await buildTxBytes((tx) =>
+      tx.transferObjects([tx.gas], SENDER),
+    )
+    expect(() => validate(gasCoin, policies)).toThrow(/may not use GasCoin/)
+
+    const splitGas = await buildTxBytes((tx) => {
+      const [coin] = tx.splitCoins(tx.gas, [100])
+      tx.transferObjects([coin!], SENDER)
+    })
+    expect(() => validate(splitGas, policies)).toThrow(/may not use GasCoin/)
+
+    const transfer = (tx: Transaction) => tx.transferObjects([owned(tx)], SENDER)
+
+    const wrongSender = await buildTxBytes(transfer, { sender: '0x3' })
+    expect(() => validate(wrongSender, policies)).toThrow(
+      /sender does not match/,
+    )
+
+    const wrongSponsor = await buildTxBytes(transfer, { sponsor: '0x3' })
+    expect(() => validate(wrongSponsor, policies)).toThrow(/gas owner/)
+
+    const sponsorSender = await buildTxBytes(transfer, { sender: SPONSOR })
+    expect(() =>
+      validateSponsoredTxPayload({
+        txBytesBase64: sponsorSender,
+        expectedSender: SPONSOR,
+        expectedSponsor: SPONSOR,
+        currentEpoch: 1n,
+        policies,
+      }),
+    ).toThrow(/cannot be the sponsor/)
+
+    const coinGas = await buildTxBytes(transfer, { gasPayment: 'coin' })
+    expect(() => validate(coinGas, policies)).toThrow(/address balance/)
+
+    const tooFar = await buildTxBytes((tx) => {
+      tx.setExpiration({ Epoch: 3 })
+      transfer(tx)
+    })
+    expect(() => validate(tooFar, policies)).toThrow(/expiration exceeds/)
+
+    const noExpiration = await buildTxBytes((tx) => {
+      tx.setExpiration({ None: true })
+      transfer(tx)
+    })
+    expect(() => validate(noExpiration, policies)).toThrow(
+      /bounded epoch expiration/,
+    )
+
+    const capped = loadPolicies([noMoveCall({ gasBudgetMax: '9' })])
+    const bare = await bareTransfer()
+    expect(() => validate(bare, capped)).toThrow(
+      /did not match any allow policy/,
+    )
+  })
+
+  test('owned inputs of a MoveCall-free transaction are returned for authorization', async () => {
+    const policies = loadPolicies([noMoveCall()])
+    const txBytes = await buildTxBytes((tx) => {
+      const [coin] = tx.splitCoins(owned(tx, OWNED_COIN), [100])
+      tx.transferObjects([coin!, owned(tx)], SENDER)
+    })
+    const plan = validate(txBytes, policies)
+    expect(plan.calledTargets).toEqual([])
+    expect([...plan.ownedInputIds].sort()).toEqual([OWNED, OWNED_COIN])
+  })
+})
