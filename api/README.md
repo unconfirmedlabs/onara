@@ -415,7 +415,8 @@ clauses are rejected at load time.
   "gasBudgetMax": "50000000000",
   "commands": {
     "allowed": ["MoveCall", "TransferObjects"],
-    "max": 5
+    "max": 5,
+    "requireMoveCall": true
   },
   "calls": {
     "mode": "set",
@@ -475,6 +476,24 @@ In set mode, an omitted count leaves multiplicity unconstrained. In sequence
 mode it means exactly one call. Sequence calls are consumed greedily in rule
 order; optional steps use a range such as `{ "min": 0, "max": 1 }`.
 
+### Transactions without a MoveCall
+
+`commands.requireMoveCall` defaults to `true`, which rejects a transaction
+with no MoveCall. Set it to `false` to let a branch sponsor MoveCall-free
+transactions, such as a bare `TransferObjects`. `commands.allowed` and
+`commands.max` still apply.
+
+Call rules and result flow still run over the empty set of calls:
+
+- set mode: a rule with `count.min` of 1 or more fails; `sameAs`, `max`-only,
+  and omitted counts pass; `ordering` is vacuous;
+- sequence mode: an omitted count means exactly one call, so it fails; only a
+  sequence whose rules all allow zero (`"min": 0`) passes; and
+- result flow: with no producer calls, every flow passes, even `required: true`.
+
+MoveCall-free transactions still pass through every sponsor-only-gas
+invariant, including the `GasCoin` ban and owned-input authorization.
+
 ### Result flow
 
 `calls.resultFlow` constrains one exact result slot on every occurrence of a
@@ -513,9 +532,9 @@ These conditions cause a policy to be **silently skipped** (the engine moves to 
 - `suinsNames` doesn't match the sender's SuiNS name (or sender has no name)
 - `gasBudgetMax` is exceeded by the transaction's gas budget
 
-Structural failures (disallowed target, command limit/kind, call count,
-ordering, sequence, result flow, or type arguments) make that allow branch
-incomplete. Every other structural branch is still considered.
+Structural failures (missing MoveCall, disallowed target, command limit/kind,
+call count, ordering, sequence, result flow, or type arguments) make that allow
+branch incomplete. Every other structural branch is still considered.
 
 ### SuiNS name matching
 
@@ -800,6 +819,8 @@ All tests run offline using the Sui SDK's `Transaction.build()` with manually se
 - Sponsor-only-gas checks (empty gas payment, `GasCoin`, sender-scoped withdrawals, owned-input authorization)
 - Server-level gas budget cap helpers (`src/gas-budget.test.ts`)
 - Set mode (target ownership, ranges, `sameAs`, ordering)
+- `commands.requireMoveCall` (default, MoveCall-free branches, zero-call rule and
+  result-flow semantics, invariants without MoveCalls)
 - Wildcards (universal, module, and package level)
 - Sequence mode (rule matching, count enforcement, extra command rejection)
 - Exact result flow (slot and argument indexes, every producer occurrence,
