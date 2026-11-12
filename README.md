@@ -135,7 +135,7 @@ requires that:
 2. the embedded transaction sender equals the requesting sender and is not the sponsor;
 3. the gas owner equals the configured sponsor;
 4. the gas payment is empty, so gas comes only from the sponsor's address balance;
-5. the transaction expires no later than the next epoch;
+5. the transaction sets an epoch expiration that has not passed (how far ahead it may be is the chain's rule, not Onara's);
 6. balance withdrawals belong to the sender, never the sponsor;
 7. commands do not reference `GasCoin`; and
 8. every owned object input is sender-owned or immutable; and

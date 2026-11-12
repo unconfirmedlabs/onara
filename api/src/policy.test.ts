@@ -342,13 +342,15 @@ describe('global transaction invariants and deny override', () => {
     expect(() => validate(txBytes, policies)).toThrow(/address balance/)
   })
 
-  test('requires expiration no later than the next epoch', async () => {
+  test('leaves how far ahead a transaction may expire to the chain', async () => {
     const policies = loadPolicies([allow()])
-    const txBytes = await buildTxBytes((tx) => {
-      tx.setExpiration({ Epoch: 3 })
-      tx.moveCall({ target: `${PKG}::mod::fn` })
-    })
-    expect(() => validate(txBytes, policies)).toThrow(/expiration exceeds/)
+    for (const epoch of [3, 31, 1000]) {
+      const txBytes = await buildTxBytes((tx) => {
+        tx.setExpiration({ Epoch: epoch })
+        tx.moveCall({ target: `${PKG}::mod::fn` })
+      })
+      expect(() => validate(txBytes, policies)).not.toThrow()
+    }
   })
 
   test('rejects an expiration that has already elapsed', async () => {
@@ -1147,11 +1149,11 @@ describe('commands.requireMoveCall', () => {
     const coinGas = await buildTxBytes(transfer, { gasPayment: 'coin' })
     expect(() => validate(coinGas, policies)).toThrow(/address balance/)
 
-    const tooFar = await buildTxBytes((tx) => {
-      tx.setExpiration({ Epoch: 3 })
+    const elapsed = await buildTxBytes((tx) => {
+      tx.setExpiration({ Epoch: 0 })
       transfer(tx)
     })
-    expect(() => validate(tooFar, policies)).toThrow(/expiration exceeds/)
+    expect(() => validate(elapsed, policies)).toThrow(/already elapsed/)
 
     const noExpiration = await buildTxBytes((tx) => {
       tx.setExpiration({ None: true })

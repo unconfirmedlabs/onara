@@ -1017,11 +1017,9 @@ export function validateSponsoredTransactionData({
   if (expirationMaxEpoch < currentEpoch) {
     throw new Error('Sponsored transaction expiration has already elapsed.')
   }
-  if (expirationMaxEpoch > currentEpoch + 1n) {
-    throw new Error(
-      `Sponsored transaction expiration exceeds the next epoch (${currentEpoch + 1n}).`,
-    )
-  }
+  // How far ahead a transaction may expire is the chain's to say, not the sponsor's: Sui
+  // accepts any later epoch for a transaction with an address-owned input, and at most two
+  // epochs of validity for one without (its replay protection).
 
   const ownedInputIds: string[] = []
   for (const input of txData.inputs) {
