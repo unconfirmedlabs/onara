@@ -131,7 +131,8 @@ branches are rejected when configuration loads.
 Policy matching is only one layer. Before Onara simulates or signs, it also
 requires that:
 
-1. the sender's signature is valid for the exact transaction bytes;
+1. the sender's signature is valid for the exact transaction bytes, from the sender or, once it
+   has enabled address aliases (`0x2::address_alias`), from an address in its current alias set;
 2. the embedded transaction sender equals the requesting sender and is not the sponsor;
 3. the gas owner equals the configured sponsor;
 4. the gas payment is empty, so gas comes only from the sponsor's address balance;
