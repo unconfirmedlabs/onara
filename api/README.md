@@ -328,7 +328,10 @@ the deploy adapter from an external `config.json`.
 When a transaction arrives at `/sponsor`, the engine:
 
 1. Rejects requests over the global/per-policy gas ceiling.
-2. Verifies the sender's signature over the exact transaction bytes.
+2. Verifies the sender's signature over the exact transaction bytes. The signer must be the
+   sender, or an address in the sender's alias set when the sender has enabled address aliases
+   (`0x2::address_alias`; the set is read from its `AddressAliases` object, derived from `0xa`),
+   which then excludes the sender's own key unless the set still lists it, as the chain does.
 3. Verifies the embedded sender and gas owner match the request and requires an
    empty gas payment (`[]`) so gas comes only from the sponsor address balance
 4. Requires an expiration no later than the next epoch
@@ -851,7 +854,7 @@ src/
   policy.test.ts  Offline test suite (bun:test)
   input-authorization.ts       Sender-owned input authorization
   input-authorization.test.ts  Owned-input authorization tests
-  sender-signature.ts          Exact-byte sender signature verification
+  sender-signature.ts          Exact-byte sender signature verification (alias-aware)
   sender-signature.test.ts     Sender signature tests
   execution.ts                 Sign-once submission and confirmation flow
   execution.test.ts            Sponsor signing/submission tests
